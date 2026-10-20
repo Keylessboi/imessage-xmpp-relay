@@ -375,6 +375,8 @@ pub struct RustpushBackend {
     /// Inbound conversations, so /im/send can reply into a group. Loaded from
     /// state.plist at boot and written back by the push loop.
     chats: Chats,
+    /// Inbound attachment storage; `None` when no HMAC key is configured.
+    files: Option<Arc<crate::attachments::Files>>,
 }
 
 impl RustpushBackend {
@@ -385,10 +387,12 @@ impl RustpushBackend {
             .backend_state()
             .and_then(|blob| plist::from_bytes(blob.as_ref()).ok())
             .unwrap_or_default();
+        let files = crate::attachments::Files::from_config(&config);
         Self {
             config,
             store,
             bus,
+            files,
             running: Arc::new(tokio::sync::RwLock::new(None)),
             generation: Arc::new(AtomicU64::new(0)),
             login: Arc::new(RwLock::new(LoginStatus::default())),
@@ -495,6 +499,7 @@ impl RustpushBackend {
             gsa_user: self.config.gsa.user.clone(),
             gsa_pass: self.config.gsa.pass_sha256.clone(),
             chats: self.chats.clone(),
+            files: self.files.clone(),
         };
 
         // Run the login in its own task. rustpush's remote anisette provider
@@ -867,6 +872,7 @@ impl Backend for RustpushBackend {
             identity,
             self.config.data_dir.join("id_cache.plist"),
             self.chats.clone(),
+            self.files.clone(),
         )
         .await;
         Ok(())
@@ -957,6 +963,7 @@ async fn install_registered(
     identity: IDSNGMIdentity,
     cache_path: PathBuf,
     chats: Chats,
+    files: Option<Arc<crate::attachments::Files>>,
 ) {
     let push_state = Some(connection.state.read().await.clone());
     let services = id_services!();
@@ -987,6 +994,7 @@ async fn install_registered(
     let loop_generation = generation.clone();
     let loop_chats = chats.clone();
     let loop_store = store.clone();
+    let loop_files = files.clone();
     tokio::spawn(async move {
         receive_loop(
             loop_connection,
@@ -996,6 +1004,7 @@ async fn install_registered(
             my_generation,
             loop_chats,
             loop_store,
+            loop_files,
         )
         .await;
     });
@@ -1027,6 +1036,7 @@ struct LoginState {
     gsa_user: String,
     gsa_pass: Vec<u8>,
     chats: Chats,
+    files: Option<Arc<crate::attachments::Files>>,
 }
 
 /// Re-attempt the Apple ID login until it succeeds (or the process exits).
@@ -1154,6 +1164,7 @@ async fn complete_apple_id(state: LoginState) -> Result<()> {
         state.identity.clone(),
         state.cache_path.clone(),
         state.chats.clone(),
+        state.files.clone(),
     )
     .await;
     Ok(())
@@ -1862,6 +1873,7 @@ async fn receive_loop(
     my_generation: u64,
     chats: Chats,
     store: StateStore,
+    files: Option<Arc<crate::attachments::Files>>,
 ) {
     let mut subscription = connection.messages_cont.subscribe();
     loop {
@@ -1893,6 +1905,12 @@ async fn receive_loop(
                     // before the message it describes.
                     for extra in crate::msgfeatures::extra_events(&inst) {
                         bus.publish(extra);
+                    }
+                    // Attachments download in their own tasks; the `attachment`
+                    // event follows once the file is on disk.
+                    if let Some(files) = &files {
+                        let (from, chat_guid) = crate::msgfeatures::context(&inst);
+                        files.spawn_downloads(&connection, &bus, &inst, inst.id.clone(), chat_guid, from);
                     }
                     if let Some(event) = message_event(&inst) {
                         tracing::info!(guid = %event.guid, from = %event.from, "inbound message");
