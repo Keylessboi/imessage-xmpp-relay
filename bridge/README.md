@@ -65,7 +65,8 @@ logged, and the startup log line renders the effective config through
 | `COMPONENT_HOST` | `127.0.0.1` | Server's component listener |
 | `COMPONENT_PORT` | `5347` | Server's component listener port |
 | `XMPP_TARGET` | `COMPONENT_OWNER` in component mode | Comma-separated "pipe" JIDs that receive 1:1 chats |
-| `XMPP_MUC` | — | Group-chat room (bare JID, e.g. `im@conference.example.org`) |
+| `XMPP_MUC` | — | Group-chat room (bare JID, e.g. `im@conference.example.org`); client mode only |
+| `XMPP_GROUPS_MUC` | `1` | Component mode: host each iMessage group as a XEP-0045 room; `0` keeps the old `[group]` chat lines |
 | `XMPP_MUC_NICK` | `imessage` | Nickname the bridge joins the room with |
 | `XMPP_CONTACTS` | — | `handle=jid` pairs, comma/semicolon separated |
 | `XMPP_ALLOWED` | empty | Bare JIDs allowed to send iMessages (**empty = deny all**; component mode adds `COMPONENT_OWNER`) |
@@ -130,8 +131,10 @@ A plain word localpart such as `alice@domain` is rejected, not guessed.
   message is never sent to the component itself.
 * **No OMEMO** in component mode (`XMPP_OMEMO=1` is rejected): an external
   component has no OMEMO device identity.
-* **Group chats** have no MUC in component mode: group events go to the owner
-  from the sender's peer JID with `[group] Name (handle): ` in the body.
+* **Group chats** are XEP-0045 rooms hosted by the component itself, see
+  [Group chats as rooms](#group-chats-as-rooms-component-mode). With
+  `XMPP_GROUPS_MUC=0` they fall back to the old `[group] Name (handle): ` lines
+  from the sender's peer JID.
 
 **ejabberd side (what this implementation assumes)**
 
@@ -166,6 +169,60 @@ listen:
   component answers subscription requests itself.
 * The component domain must not be the owner's domain; config refuses a
   `COMPONENT_OWNER` inside `COMPONENT_DOMAIN` (that would loop).
+
+### Group chats as rooms (component mode)
+
+Standard XEPs only: 0045 (MUC), 0030 (disco), 0249 (direct invite), 0059 (RSM),
+0203 (delayed delivery). No custom namespace. Code: [relay/muc.py](relay/muc.py).
+`XMPP_GROUPS_MUC` (default `1`) turns it off.
+
+**Where the rooms live.** In the component's own domain, not a `muc.` subdomain:
+`grp-u<32 hex>@imessage.example.org` (an uppercase-UUID group id, the usual
+case) or `grp-x<hex of the id>@...` (any other id). The component *is* the MUC
+service, so the ejabberd side needs no `mod_muc`, no second `hosts` entry, no
+extra DNS record or certificate, and the localparts can never collide with a
+peer JID (`-u`/`-x` is not a hex escape, so `localpart_to_handle` rejects
+them). A subdomain would have needed a second domain on the listener; this
+repository does not hold the ejabberd config, so it was not assumed.
+
+| iMessage | XMPP |
+| --- | --- |
+| group message from a member | `groupchat` from `room/<handle>` (the nick is the phone number or Apple ID) |
+| a group appears, or messages arrive while the owner is not in the room | XEP-0249 direct invite from the room (re-sent at most every 10 min); messages are kept as room history |
+| group renamed | room subject change |
+| member added / removed / left | occupant presence (`affiliation=member`, real JID shown) plus a `groupchat` status line from the room |
+| group icon changed | status line only (icons are not mirrored: there is no attachment support yet) |
+| owner types in the room | `POST /im/send {"chat_guid"}`; the message is reflected to every joined session as MUC requires |
+| owner changes the subject, or submits the `muc#roomconfig_roomname` form | `POST /im/group/rename` |
+| owner invites a contact (`<invite to='+1555...@domain'/>`) or sets `affiliation=member` | `POST /im/group/members {add}` |
+| owner kicks (`role=none`) or sets `affiliation=none` / `outcast` | `POST /im/group/members {remove}` |
+| owner **destroys** the room (`muc#owner` `<destroy/>`) | `POST /im/group/leave`: the only way to leave the iMessage group. Just exiting the room leaves it on the XMPP side only |
+| `disco#items` on the component | the groups, paged with XEP-0059 (`max` / `after`) |
+| joining a room | `<history/>` honoured (`maxstanzas`, `maxchars`, `seconds`, `since`); replayed messages carry XEP-0203 `<delay/>` |
+
+**Creating a group from XMPP.** Join a room name that does not exist, e.g.
+`weekend@imessage.example.org`. That makes a *draft* room (status 201, offered in
+`disco#items`). Invite at least two contacts (mediated invites to their peer
+JIDs). The first message creates the iMessage group (`POST /im/group`: an
+iMessage group is created by sending its first message, with the name and member
+list attached) and moves you: the draft is destroyed with an alternate venue
+(XEP-0045 10.9) and a direct invite to the real `grp-...` room follows. Fewer
+than two invited contacts is refused with `not-acceptable`: two members is a
+plain 1:1 chat in iMessage.
+
+**Behaviour you should know.** Only `COMPONENT_OWNER` can do anything; every
+other JID is dropped. The owner has one nick per room (all of their sessions
+share it) and it cannot equal an occupant's handle. Private messages to
+occupants are refused. History is in memory (last 100 messages per room) and
+starts when the bridge starts; it is not persisted. Group names and member lists
+are loaded from `GET /im/groups` on every SSE `ready`.
+
+**Untested.** The tests cover the pure mapping, every handler against a fake
+component, and real slixmpp stanza parsing/dispatch (no socket). Not run: a real
+ejabberd with this room traffic, any real XMPP client (Conversations, Dino,
+Gajim: how they render component-hosted rooms, the direct invite and the
+draft-to-group handoff), and every group operation against real Apple (see the
+server README).
 
 ### OMEMO 2 end-to-end encryption
 

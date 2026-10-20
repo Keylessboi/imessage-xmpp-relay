@@ -73,13 +73,24 @@ Secrets are never logged. `state.plist` and the keystore are written mode `0600`
 | GET | `/im/events` | `text/event-stream`, one JSON object per `data:` line |
 | POST | `/im/register-phone` | body `{"number":"+1555...","signature":"<hex from REG-RESP>"}` → `{"ok":true,"handle":"tel:+1555..."}` |
 | GET | `/apns-token` | `{"token":"<hex>"}`, or 503 while APS has no token |
+| GET | `/im/groups` | additive: `{"groups":[{"chat_guid","name","participants":[bare handles incl. ours],"group_version"}]}` |
+| POST | `/im/group` | additive: body `{"participants":["+1555..",".."],"name":null,"text":"first message"}` (>= 2 others; `text` or `name` required) → `{"ok":true,"chat_guid","guid","group"}` |
+| POST | `/im/group/rename` | additive: body `{"chat_guid","name"}` → `{"ok":true,"group"}` |
+| POST | `/im/group/members` | additive: body `{"chat_guid","add":[..],"remove":[..]}` (group stays >= 3 members) → `{"ok":true,"group"}` |
+| POST | `/im/group/leave` | additive: body `{"chat_guid"}` → `{"ok":true}` |
 
 SSE payloads:
 
 ```json
 {"type":"ready"}
 {"type":"message","guid":"...","chat_guid":"iMessage;-;+15551234567","from":"+15551234567","to":["me@example.com"],"text":"hi","timestamp":1700000000000,"is_group":false,"sender_name":null}
+{"type":"group","kind":"rename|participants|icon","guid":"...","chat_guid":"...","from":"+15557654321","name":"Crew","participants":["+1555.."],"added":[],"removed":[],"timestamp":1700000000000}
 ```
+
+The `group` event is additive (a peer renamed the group, changed its members or
+its icon); consumers that only know `ready` and `message` ignore it. The
+`message` event and `/im/send` are byte-identical to before. The `/im/group*`
+endpoints are likewise new; they answer `503` from the stub backend.
 
 `{"type":"ready"}` is emitted once IDS registration completes, and is also sent
 immediately to a client that connects after registration.

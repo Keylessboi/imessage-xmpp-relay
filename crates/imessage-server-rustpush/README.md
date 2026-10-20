@@ -330,6 +330,33 @@ Unknown `chat_guid` returns `503` with an explicit message instead of guessing.
 seen by this relay, so there is no real `gid` to reply into. An inbound group
 text to the relay's number is the acceptance test.
 
+### Group management: `/im/group*` and the `group` event (2026-10-20)
+
+Additive; the frozen endpoints and the `message` event are untouched. An iMessage
+group has no server-side object: it is a member list plus a group id (`gid`, our
+`chat_guid`), and every change is just another message carrying that id. So
+`src/groups.rs` holds pure state transitions over the saved chat map
+(`SavedChat` gained `name` and `group_version`), and `Backend::group_op`
+(`src/backend.rs`, section "group chats") sends one message then updates the copy:
+
+| Op | Wire message (rustpush) |
+| --- | --- |
+| create | the first `Message::Message` (or, with no text, a `RenameMessage`) with a fresh uppercase-UUID `sender_guid`, the member list and `cv_name` |
+| rename | `Message::RenameMessage` |
+| add / remove members | `Message::ChangeParticipants` with `group_version` + 1 |
+| leave | `Message::ChangeParticipants` without our handles (how iMessage leaves) |
+
+Inbound `RenameMessage`, `ChangeParticipants` and `IconChange` update the saved
+chat and publish a `group` SSE event. Replies into a group now also carry the
+recorded `cv_name`.
+
+**Verified:** the pure functions (`cargo test`: member add/remove/leave rules,
+the three-member floor, inbound event derivation). **Not verified:** any of it on
+the wire against Apple, from either direction. Whether Apple accepts a
+rename-only create, and how other devices render a `group_version` we chose
+ourselves, are unknown. Outbound icon change is not implemented (no attachment
+support).
+
 ## Enabling / building
 
 ```sh
