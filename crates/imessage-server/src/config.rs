@@ -42,8 +42,89 @@ impl std::fmt::Debug for GsaConfig {
     }
 }
 
+/// Inbound attachment download + public file listener. Present only when
+/// `IMESSAGE_FILE_HMAC_KEY_FILE` is set; without a signing key there is no way
+/// to hand out a link, so the feature stays entirely off (nothing is
+/// downloaded, no extra port is opened).
+#[derive(Clone)]
+pub struct FilesConfig {
+    /// `IMESSAGE_ATTACH_DIR`, default `<data_dir>/attachments`.
+    pub dir: PathBuf,
+    pub limits: crate::attach::Limits,
+    /// `IMESSAGE_FILES_LISTEN`, default `0.0.0.0:8791`: the ONLY thing served
+    /// there is `GET /dl/<id>`; the control API stays on `LISTEN`.
+    pub listen: SocketAddr,
+    /// HMAC key bytes, read from the file named by `IMESSAGE_FILE_HMAC_KEY_FILE`.
+    pub hmac_key: Vec<u8>,
+    /// `IMESSAGE_FILE_URL_TTL_SECS`, default 1800.
+    pub url_ttl_secs: i64,
+}
+
+impl std::fmt::Debug for FilesConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FilesConfig")
+            .field("dir", &self.dir)
+            .field("limits", &self.limits)
+            .field("listen", &self.listen)
+            .field("hmac_key", &"<redacted>")
+            .field("url_ttl_secs", &self.url_ttl_secs)
+            .finish()
+    }
+}
+
+pub const DEFAULT_FILES_LISTEN: &str = "0.0.0.0:8791";
+const MIN_HMAC_KEY_BYTES: usize = 16;
+
+fn env_num<T: std::str::FromStr>(name: &str, default: T) -> Result<T> {
+    match env_opt(name) {
+        None => Ok(default),
+        Some(v) => v
+            .trim()
+            .parse()
+            .map_err(|_| anyhow!("{name}={v:?} is not a valid number")),
+    }
+}
+
+/// Key file contents: surrounding whitespace (the trailing newline a secret
+/// volume or `echo` adds) is dropped; the rest is the raw key.
+fn read_hmac_key(path: &str) -> Result<Vec<u8>> {
+    let raw = std::fs::read(path)
+        .map_err(|e| anyhow!("IMESSAGE_FILE_HMAC_KEY_FILE={path} is not readable ({:?})", e.kind()))?;
+    let key = String::from_utf8_lossy(&raw).trim().as_bytes().to_vec();
+    if key.len() < MIN_HMAC_KEY_BYTES {
+        bail!("IMESSAGE_FILE_HMAC_KEY_FILE={path} must hold at least {MIN_HMAC_KEY_BYTES} bytes");
+    }
+    Ok(key)
+}
+
+fn load_files(data_dir: &Path) -> Result<Option<FilesConfig>> {
+    let Some(key_path) = env_opt("IMESSAGE_FILE_HMAC_KEY_FILE") else {
+        return Ok(None);
+    };
+    let hmac_key = read_hmac_key(key_path.trim())?;
+    let listen_raw = env_opt("IMESSAGE_FILES_LISTEN").unwrap_or_else(|| DEFAULT_FILES_LISTEN.into());
+    let listen: SocketAddr = listen_raw
+        .parse()
+        .with_context(|| format!("IMESSAGE_FILES_LISTEN={listen_raw:?} is not a host:port socket address"))?;
+    Ok(Some(FilesConfig {
+        dir: env_opt("IMESSAGE_ATTACH_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| data_dir.join("attachments")),
+        limits: crate::attach::Limits {
+            max_file_bytes: env_num("IMESSAGE_ATTACH_MAX_BYTES", 100u64 << 20)?,
+            quota_bytes: env_num("IMESSAGE_ATTACH_QUOTA_BYTES", 2u64 << 30)?,
+            max_age_secs: env_num("IMESSAGE_ATTACH_MAX_AGE_SECS", 7 * 24 * 3600)?,
+        },
+        listen,
+        hmac_key,
+        url_ttl_secs: env_num("IMESSAGE_FILE_URL_TTL_SECS", 1800)?,
+    }))
+}
+
 pub struct Config {
     pub data_dir: PathBuf,
+    /// Attachment storage and the public download listener; `None` = disabled.
+    pub files: Option<FilesConfig>,
     pub listen: SocketAddr,
     pub gsa: GsaConfig,
     /// Raw bytes of the hardware config plist, so the real backend can deserialize
@@ -59,6 +140,7 @@ impl std::fmt::Debug for Config {
             .field("data_dir", &self.data_dir)
             .field("listen", &self.listen)
             .field("gsa", &self.gsa)
+            .field("files", &self.files)
             .field("hwconfig_source", &self.hwconfig_source)
             .field(
                 "hwconfig_raw",
@@ -185,9 +267,11 @@ impl Config {
             .with_context(|| format!("{} is not a valid plist", hwconfig_source))?;
 
         let gsa = load_gsa(&data_dir)?;
+        let files = load_files(&data_dir)?;
 
         Ok(Config {
             data_dir,
+            files,
             listen,
             gsa,
             hwconfig_raw,
@@ -203,6 +287,19 @@ mod tests {
     #[test]
     fn default_listen_is_localhost() {
         assert_eq!(DEFAULT_LISTEN, "127.0.0.1:8790");
+    }
+
+    #[test]
+    fn hmac_key_file_is_trimmed_and_length_checked() {
+        let dir = std::env::temp_dir().join(format!("ims-key-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("k");
+        std::fs::write(&f, "0123456789abcdef0123\n").unwrap();
+        assert_eq!(read_hmac_key(f.to_str().unwrap()).unwrap(), b"0123456789abcdef0123");
+        std::fs::write(&f, "short\n").unwrap();
+        assert!(read_hmac_key(f.to_str().unwrap()).is_err());
+        assert!(read_hmac_key(dir.join("nope").to_str().unwrap()).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

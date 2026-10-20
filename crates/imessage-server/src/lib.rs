@@ -23,9 +23,11 @@ use crate::events::EventBus;
 use crate::state::StateStore;
 
 pub mod api;
+pub mod attach;
 pub mod backend;
 pub mod config;
 pub mod events;
+pub mod files;
 pub mod hexutil;
 pub mod state;
 
@@ -48,6 +50,7 @@ where
     );
 
     let listen = config.listen;
+    let files = config.files.clone();
     let bus = EventBus::new();
     let store = StateStore::load(
         config.data_dir.join("state.plist"),
@@ -72,6 +75,24 @@ where
             tracing::error!("backend ({}) failed to start: {e}", startup_backend.name());
         }
     });
+
+    // The public download listener runs on its own port with its own router;
+    // the control API below is never reachable through it.
+    if let Some(files) = files {
+        let store = attach::Store::open(files.dir.clone(), files.limits.clone())?;
+        let state = Arc::new(files::FilesState {
+            store,
+            signer: files::Signer::new(files.hmac_key.clone()),
+        });
+        let addr = files.listen;
+        tokio::spawn(async move {
+            if let Err(e) = files::serve(state, addr).await {
+                tracing::error!("attachment listener failed: {e}");
+            }
+        });
+    } else {
+        tracing::info!("attachments disabled (IMESSAGE_FILE_HMAC_KEY_FILE not set)");
+    }
 
     let app = api::router(Arc::new(api::AppState::new(store, backend, bus)));
 
