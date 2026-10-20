@@ -620,6 +620,62 @@ impl RustpushBackend {
         self.send_with(conversation, text, reply_to).await
     }
 
+    /// Receipt, typing, tapback, edit or unsend to a 1:1 peer or an existing
+    /// group. Conversation resolution mirrors `send_group_inner`/`send_inner`.
+    async fn send_action_inner(
+        &self,
+        to: &str,
+        chat_guid: Option<&str>,
+        action: &Action,
+    ) -> Result<String> {
+        let conversation = match chat_guid {
+            Some(chat_guid) => {
+                let chat = self
+                    .chats
+                    .read()
+                    .map_err(|_| anyhow!("conversation map lock poisoned"))?
+                    .get(chat_guid)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("unknown chat_guid `{chat_guid}`"))?;
+                let sender_guid = chat
+                    .sender_guid
+                    .clone()
+                    .ok_or_else(|| anyhow!("chat `{chat_guid}` has no iMessage group id"))?;
+                group_conversation(&chat, sender_guid)
+            }
+            None => ConversationData {
+                participants: vec![imessage_server::events::normalize_handle(to)],
+                cv_name: None,
+                sender_guid: Some(uuid::Uuid::new_v4().to_string()),
+                after_guid: None,
+            },
+        };
+        let message = crate::msgfeatures::build_message(action)?;
+
+        let guard = self.running.read().await;
+        let running = guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("backend is not running yet"))?;
+        let client = running.client.as_ref().ok_or_else(|| {
+            anyhow!("no IDS user is registered with Apple yet (Apple ID login failed or no phone number registered)")
+        })?;
+        let handles = client.identity.get_handles().await;
+        let sender = handles
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow!("no IDS handle is registered"))?;
+        let mut inst = MessageInst::new(conversation, &sender, message);
+        if let Some(id) = crate::msgfeatures::message_id_override(action) {
+            inst.id = id.to_string();
+        }
+        let guid = inst.id.clone();
+        client
+            .send(&mut inst)
+            .await
+            .map_err(|e| anyhow!("send failed: {e}"))?;
+        Ok(guid)
+    }
+
     /// Mint (or reuse) a FaceTime join link from the registered IDS identity.
     ///
     /// rustpush builds the link from an IDS pseudonym (`create_pseudonym`,
