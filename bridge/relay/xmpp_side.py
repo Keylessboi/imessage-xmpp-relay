@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import ssl
-from typing import Awaitable, Callable, Optional, Protocol, runtime_checkable
+from typing import Any, Awaitable, Callable, Optional, Protocol, Sequence, runtime_checkable
 
 from .config import Config
 from .logsetup import get_logger
@@ -44,11 +44,16 @@ class XmppTransport(Protocol):
         mtype: str = "chat",
         muc_nick: Optional[str] = None,
         frm: Optional[str] = None,
+        msg_id: Optional[str] = None,
+        elements: Sequence[Any] = (),
     ) -> None:
         """Send one chat or groupchat message.
 
         `frm` is only meaningful for component mode, where each peer JID is
         the sender; a client transport has a fixed account identity.
+        `msg_id` and `elements` (etree payloads for receipts, reactions, ...)
+        are honoured by the component transport only; the core passes them
+        only in component mode.
         """
 
 
@@ -163,6 +168,8 @@ class SlixmppTransport:
         mtype: str = "chat",
         muc_nick: Optional[str] = None,
         frm: Optional[str] = None,
+        msg_id: Optional[str] = None,
+        elements: Sequence[Any] = (),
     ) -> None:
         if frm:
             # A client account cannot choose its From; ignore rather than spoof.

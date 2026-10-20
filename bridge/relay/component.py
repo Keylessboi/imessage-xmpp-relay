@@ -28,12 +28,13 @@ from __future__ import annotations
 
 import asyncio
 import re
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 from .config import Config
 from .logsetup import get_logger
 from .models import IncomingXmpp, bare_jid, normalize_handle
 from .upstream import Backoff
+from .xep import parse_features, strip_fallback
 from .xmpp_side import IncomingHandler
 
 log = get_logger("relay.component")
@@ -249,6 +250,8 @@ class ComponentTransport:
         mtype: str = "chat",
         muc_nick: Optional[str] = None,
         frm: Optional[str] = None,
+        msg_id: Optional[str] = None,
+        elements: Sequence[Any] = (),
     ) -> None:
         target = (to or "").strip()
         if not target:
@@ -271,7 +274,12 @@ class ComponentTransport:
                     frm=sender,
                 )
                 sender = self.cfg.component_jid
-        msg = self.xmpp.make_message(mto=target, mbody=body, mtype=mtype, mfrom=sender)
+        msg = self.xmpp.make_message(mto=target, mbody=body or None, mtype=mtype, mfrom=sender)
+        if msg_id:
+            msg["id"] = msg_id
+        for element in elements:
+            # Feature payloads (receipts, reactions, ...) are plain etree elements.
+            msg.xml.append(element)
         await self._send(msg)
 
     # -- inbound stanzas ---------------------------------------------------
@@ -310,8 +318,10 @@ class ComponentTransport:
             return
 
         body = msg["body"]
-        if not body or not str(body).strip():
-            # Chat states, receipts, carbons, markers: no text, nothing to send.
+        features = parse_features(getattr(msg, "xml", None))
+        text = strip_fallback(str(body), features) if body else ""
+        if not text.strip() and not features.interesting:
+            # Plain receipts (XEP-0184 <received/>), carbons: nothing to act on.
             log.debug("ignoring stanza without text", event="component_no_body", to_jid=to_jid)
             return
 
@@ -319,12 +329,23 @@ class ComponentTransport:
             log.warning("no incoming handler registered; dropping message", event="xmpp_no_handler")
             return
 
+        marker_kind, marker_id = features.marker or (None, None)
         await self._handler(
             IncomingXmpp(
                 from_jid=str(msg["from"]),
-                body=str(body),
+                body=text,
                 mtype="chat",
                 to_jid=to_jid,
+                msg_id=features.msg_id,
+                receipt_request=features.receipt_request,
+                markable=features.markable,
+                displayed_id=marker_id if marker_kind == "displayed" else None,
+                chat_state=features.chat_state,
+                reactions_id=features.reactions_id,
+                reactions=features.reactions,
+                reply_id=features.reply_id,
+                replace_id=features.replace_id,
+                retract_id=features.retract_id,
             )
         )
 

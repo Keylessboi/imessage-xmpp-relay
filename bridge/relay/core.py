@@ -5,6 +5,7 @@ routing layer can be exercised with a fake transport in tests.
 """
 from __future__ import annotations
 
+import copy
 from collections import Counter, OrderedDict
 from typing import Optional
 
@@ -20,6 +21,7 @@ from .models import (
     normalize_handle,
     parse_target_prefix,
 )
+from .rich import RICH_EVENTS, RichFeatures
 from .upstream import UpstreamClient, UpstreamError
 from .xmpp_side import XmppTransport
 
@@ -147,6 +149,7 @@ class Bridge:
         self.replies = replies or ReplyTracker()
         self.stats: Counter = Counter()
         self._deny_logged = False
+        self.rich = RichFeatures(cfg, transport, upstream, self._notify, self.stats)
         transport.set_incoming_handler(self.on_xmpp_message)
 
     # -- iMessage -> XMPP --------------------------------------------------
@@ -155,6 +158,9 @@ class Bridge:
         etype = event.get("type")
         if etype == "ready":
             log.info("imessage-server reported ready", event="upstream_ready")
+            return
+        if etype in RICH_EVENTS:
+            await self.rich.on_event(str(etype), event)
             return
         if etype != "message":
             log.debug("ignoring event", event="upstream_event_ignored", type=str(etype))
@@ -171,6 +177,7 @@ class Bridge:
             )
             return
 
+        message, extras = self.rich.decorate(message)
         outgoing = plan_delivery(self.cfg, message)
         if not outgoing:
             self.stats["unrouted"] += 1
@@ -183,16 +190,27 @@ class Bridge:
             )
             return
 
+        self.rich.remember_inbound(message)
         for stanza in outgoing:
             self.replies.remember(message.sender, message.guid)
             self.replies.remember(stanza.to, message.guid)
+            body = stanza.body
+            # Component mode only: stanza id, receipt/marker requests, reply payload.
+            rich_kwargs: dict = {}
+            if extras is not None:
+                body = extras.quote_prefix + body
+                rich_kwargs = {
+                    "msg_id": extras.msg_id,
+                    "elements": [copy.deepcopy(e) for e in extras.elements],
+                }
             try:
                 await self.transport.send_message(
                     to=stanza.to,
-                    body=stanza.body,
+                    body=body,
                     mtype=stanza.mtype,
                     muc_nick=stanza.muc_nick,
                     frm=stanza.frm,
+                    **rich_kwargs,
                 )
             except Exception:
                 self.stats["delivery_errors"] += 1
@@ -216,7 +234,9 @@ class Bridge:
     # -- XMPP -> iMessage --------------------------------------------------
 
     async def on_xmpp_message(self, message: IncomingXmpp) -> None:
-        if message.mtype == "error" or not message.body.strip():
+        if message.mtype == "error":
+            return
+        if not message.body.strip() and not message.has_features:
             return
 
         if not self._is_allowed(message):
@@ -249,10 +269,18 @@ class Bridge:
             )
             return
 
+        # Receipts, typing, reactions, corrections and retractions (component mode).
+        if await self.rich.on_xmpp(message, handle):
+            return
+
         if not text.strip():
             return
 
-        reply_to = self.replies.get(handle) or self.replies.get(message.bare)
+        reply_to = (
+            self.rich.reply_guid(message)
+            or self.replies.get(handle)
+            or self.replies.get(message.bare)
+        )
         try:
             result = await self.upstream.send(handle, text, reply_to=reply_to)
         except UpstreamError as exc:
@@ -267,6 +295,7 @@ class Bridge:
             return
 
         self.stats["sent"] += 1
+        self.rich.record_outbound(message, handle, text, result)
         log.info(
             "sent XMPP message to iMessage",
             event="sent",

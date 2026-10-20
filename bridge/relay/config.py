@@ -56,6 +56,13 @@ def _bool(value: Optional[str]) -> bool:
     return (value or "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _flag(value: Optional[str], default: bool) -> bool:
+    """A boolean env var that is on by default unless explicitly turned off."""
+    if value is None or not value.strip():
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
 def split_list(raw: Optional[str]) -> list[str]:
     """Comma and/or whitespace separated list."""
     return [item for item in (raw or "").replace(",", " ").split() if item]
@@ -133,6 +140,8 @@ class Config:
 
     # Behaviour
     dedup_size: int = 4096
+    send_read_receipts: bool = True        # RELAY_SEND_READ_RECEIPTS: XEP-0333 displayed -> iMessage read
+    send_typing: bool = True               # RELAY_SEND_TYPING: XEP-0085 composing -> iMessage typing
     backoff_initial: float = 1.0
     backoff_factor: float = 2.0
     backoff_max: float = 60.0
@@ -318,6 +327,8 @@ class Config:
             api_url=(e.get("IMESSAGE_API_URL") or DEFAULT_API_URL).rstrip("/"),
             request_timeout=float(e.get("REQUEST_TIMEOUT") or 15),
             dedup_size=int(e.get("DEDUP_SIZE") or 4096),
+            send_read_receipts=_flag(e.get("RELAY_SEND_READ_RECEIPTS"), True),
+            send_typing=_flag(e.get("RELAY_SEND_TYPING"), True),
             backoff_initial=float(e.get("BACKOFF_INITIAL") or 1.0),
             backoff_factor=float(e.get("BACKOFF_FACTOR") or 2.0),
             backoff_max=float(e.get("BACKOFF_MAX") or 60.0),

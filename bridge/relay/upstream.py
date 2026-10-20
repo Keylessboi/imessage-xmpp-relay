@@ -5,6 +5,7 @@ Talks to:
 * GET  /health
 * GET  /im/status
 * POST /im/send
+* POST /im/read|typing|react|edit|unsend   (additive)
 * GET  /im/events   (Server-Sent Events)
 
 The event stream reconnects with exponential backoff plus jitter. A non-2xx
@@ -153,6 +154,37 @@ class UpstreamClient:
                     return {"ok": True, "raw": body[:200]}
         except aiohttp.ClientError as exc:
             raise UpstreamError("POST /im/send failed: " + str(exc)) from exc
+
+    async def action(self, kind: str, **fields) -> dict:
+        """POST /im/<kind> (read|typing|react|edit|unsend); additive endpoints.
+
+        `fields` are the JSON body; None values are dropped. Raises UpstreamError
+        on any non-2xx response (older servers answer 404).
+        """
+        path = "/im/" + kind
+        payload = {k: v for k, v in fields.items() if v is not None}
+        try:
+            async with self.session.post(
+                self.base_url + path,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=self.timeout),
+            ) as resp:
+                body = await resp.text()
+                if resp.status // 100 != 2:
+                    detail = body[:300]
+                    try:
+                        parsed = json.loads(body)
+                        if isinstance(parsed, dict) and parsed.get("error"):
+                            detail = str(parsed["error"])
+                    except ValueError:
+                        pass
+                    raise UpstreamError("POST " + path + " -> " + str(resp.status) + ": " + detail)
+                try:
+                    return json.loads(body) if body else {}
+                except ValueError:
+                    return {"ok": True, "raw": body[:200]}
+        except aiohttp.ClientError as exc:
+            raise UpstreamError("POST " + path + " failed: " + str(exc)) from exc
 
     # -- event stream ------------------------------------------------------
 

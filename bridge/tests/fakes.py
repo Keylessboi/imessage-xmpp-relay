@@ -12,6 +12,8 @@ class FakeTransport:
 
     def __init__(self, *, fail_sends: bool = False) -> None:
         self.sent: list[dict] = []
+        # Parallel to `sent`: msg_id/elements, kept apart so `sent` entries stay exact.
+        self.extras: list[dict] = []
         self.handler = None
         self.started = False
         self.stopped = False
@@ -37,9 +39,12 @@ class FakeTransport:
         mtype: str = "chat",
         muc_nick: Optional[str] = None,
         frm: Optional[str] = None,
+        msg_id: Optional[str] = None,
+        elements=(),
     ) -> None:
         if self.fail_sends:
             raise RuntimeError("fake transport failure")
+        self.extras.append({"msg_id": msg_id, "elements": list(elements)})
         entry = {"to": to, "body": body, "mtype": mtype, "muc_nick": muc_nick}
         if frm is not None:  # client mode never sets it; keeps old assertions exact
             entry["frm"] = frm
@@ -58,6 +63,8 @@ class FakeComponentTransport:
 
     def __init__(self, *, fail_sends: bool = False) -> None:
         self.sent: list[dict] = []
+        # Parallel to `sent`: msg_id/elements, kept apart so `sent` entries stay exact.
+        self.extras: list[dict] = []
         self.handler = None
         self.started = False
         self.stopped = False
@@ -83,9 +90,12 @@ class FakeComponentTransport:
         mtype: str = "chat",
         muc_nick: Optional[str] = None,
         frm: Optional[str] = None,
+        msg_id: Optional[str] = None,
+        elements=(),
     ) -> None:
         if self.fail_sends:
             raise RuntimeError("fake component transport failure")
+        self.extras.append({"msg_id": msg_id, "elements": list(elements)})
         self.sent.append(
             {"to": to, "body": body, "mtype": mtype, "muc_nick": muc_nick, "frm": frm}
         )
@@ -109,14 +119,28 @@ class FakeStanza(dict):
     def __getitem__(self, key):
         return self.get(key, "")
 
+    @property
+    def xml(self):
+        """The etree element of the stanza (tests pass one as `xml=`), else None."""
+        return self.get("xml")
+
 
 class _FakeOutgoingStanza:
     def __init__(self, xmpp, record: dict) -> None:
+        import xml.etree.ElementTree as ET
+
         self._xmpp = xmpp
         self._record = record
+        self.xml = ET.Element("message")
+
+    def __setitem__(self, key, value) -> None:
+        self._record[key] = value
 
     def send(self) -> None:
-        self._xmpp.sent.append(dict(self._record))
+        record = dict(self._record)
+        if len(self.xml):
+            record["elements"] = list(self.xml)
+        self._xmpp.sent.append(record)
 
 
 class FakeComponentXmpp:

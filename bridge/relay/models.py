@@ -31,6 +31,28 @@ class IncomingXmpp:
     # Component mode only: the recipient JID on the wire. The peer handle is
     # encoded in its localpart (see relay/component.py).
     to_jid: Optional[str] = None
+    # Message features (component mode; see relay/xep.py). All additive: a
+    # plain text stanza leaves them at their defaults.
+    msg_id: Optional[str] = None
+    receipt_request: bool = False          # XEP-0184 <request/>
+    markable: bool = False                 # XEP-0333 <markable/>
+    displayed_id: Optional[str] = None     # XEP-0333 <displayed id=/>
+    chat_state: Optional[str] = None       # XEP-0085 composing/active/...
+    reactions_id: Optional[str] = None     # XEP-0444 target id
+    reactions: Optional[tuple[str, ...]] = None  # the sender's full emoji set
+    reply_id: Optional[str] = None         # XEP-0461 target id
+    replace_id: Optional[str] = None       # XEP-0308 corrected message id
+    retract_id: Optional[str] = None       # XEP-0424 retracted message id
+
+    @property
+    def has_features(self) -> bool:
+        return bool(
+            self.displayed_id
+            or self.chat_state
+            or self.reactions is not None
+            or self.replace_id
+            or self.retract_id
+        )
 
     @property
     def bare(self) -> str:
