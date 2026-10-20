@@ -208,6 +208,38 @@ event (reply target, attachment list) just before the `message` it describes;
 the bridge needs a server that does so for reply/placeholder detail and
 degrades to plain text without it.
 
+### Attachments (XEP-0066)
+
+Inbound: when the server has downloaded an attachment it publishes an
+additive `attachment` event carrying a signed, short-lived `/dl/<id>?exp=&sig=`
+path. With `PUBLIC_FILE_BASE_URL` set (e.g. `https://imessage-files.sandstorm.chat`)
+the bridge sends the owner a message whose body is the full URL plus
+`<x xmlns='jabber:x:oob'><url/><desc/></x>` (XEP-0066) and a `<store/>` hint,
+from the peer's JID (component mode), so clients show a file. Without the
+setting the event is logged and dropped (the text placeholder still goes out).
+Client mode has no stanza extras, so it sends the URL as the body only.
+
+Outbound (component mode): the owner posts a message to a peer JID whose
+`jabber:x:oob` URL points at a file. The bridge fetches it and hands the bytes
+to `POST /im/attachment`. Because whoever controls the XMPP account chooses
+that URL, the fetch is SSRF-guarded: http/https on ports 80/443 only, no
+credentials, every resolved address must be globally routable (checked inside
+the resolver aiohttp connects through, so there is no check/connect gap, and
+every redirect hop, at most 3, is re-validated before it is requested), a byte
+cap enforced while streaming, an overall time limit, and the body goes to a temp
+file. A body that is more than the URL is sent as a text caption after the file.
+A refused URL is reported back to the owner. XEP-0363 (HTTP upload slots) is
+**not** implemented: it needs a writable public endpoint, which the approved
+design (a read-only `/dl` listener) deliberately does not have.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PUBLIC_FILE_BASE_URL` | unset | Public origin of the server's `/dl` listener; unset drops `attachment` events |
+| `OUTBOUND_MAX_BYTES` | `104857600` | Largest file fetched for an outbound attachment |
+| `OUTBOUND_FETCH_TIMEOUT` | `120` | Seconds allowed for that fetch |
+
+The component also answers XEP-0030 service discovery with `jabber:x:oob`.
+
 ### OMEMO 2 end-to-end encryption
 
 `XMPP_OMEMO=1` encrypts **1:1** XMPP messages with OMEMO in the
@@ -348,6 +380,12 @@ timeout 40 .venv/bin/python smoke_real_transport.py   # prints SMOKE_OK
 ```
 
 ## What is NOT proven
+
+* **Attachments (both directions) are unit-tested only.** The bridge side runs
+  against a fake transport, a mock upstream and a local file host. No stanza
+  reached a real XMPP client, so which clients render the OOB message as a file
+  is unverified, and no attachment has crossed Apple's MMCS (see the root
+  README).
 
 * **Message features (receipts, typing, reactions, replies, edits, retractions,
   placeholders) are covered by unit tests with a fake transport and a mock

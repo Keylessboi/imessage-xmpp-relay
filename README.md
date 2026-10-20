@@ -365,6 +365,38 @@ depends on the Apple ID login completing.
 - **The number is fixed by the carrier signature**; holding a different number needs
   that number's SIM to answer the `REG-REQ`.
 
+### Attachments (built, not proven against Apple)
+
+Design and security notes: [docs/k8s-attachments.md](docs/k8s-attachments.md).
+
+- **Inbound.** The rustpush backend downloads each attachment of an inbound
+  message through MMCS (`Attachment::get_attachment`) into `IMESSAGE_ATTACH_DIR`
+  (default `<data>/attachments`) and publishes an additive `attachment` SSE event
+  `{guid, chat_guid, from, id, name, mime, size, path}`. The existing `message`
+  and `message_meta` events are unchanged. Storage treats the sender as hostile:
+  random ids, sanitised names, mime sniffed from the bytes, a per-file cap
+  (`IMESSAGE_ATTACH_MAX_BYTES`, 100 MiB), a total quota (`IMESSAGE_ATTACH_QUOTA_BYTES`,
+  2 GiB, oldest evicted first) and a maximum age (`IMESSAGE_ATTACH_MAX_AGE_SECS`, 7 days).
+- **Serving.** A SEPARATE listener (`IMESSAGE_FILES_LISTEN`, default `0.0.0.0:8791`)
+  serves only `GET /dl/<id>?exp=&sig=`: HMAC-SHA256 over `id`, newline, `exp` with the
+  key read from the file named by `IMESSAGE_FILE_HMAC_KEY_FILE` (constant-time compare,
+  signature checked before expiry, `IMESSAGE_FILE_URL_TTL_SECS` default 1800), always
+  `Content-Disposition: attachment`, `X-Content-Type-Options: nosniff`, a `sandbox` CSP,
+  `no-store`. No key file means the feature is off: nothing is downloaded and the port
+  is not opened.
+- **Outbound.** `POST /im/attachment?to=|chat_guid=&name=&mime=` takes the raw file
+  as the body (capped, spooled, sanitised, mime sniffed), uploads it with
+  `MMCSFile::prepare_put` + `Attachment::new_mmcs` and sends it as a normal
+  iMessage attachment part. The bridge feeds it from an XEP-0066 URL the owner posts.
+- **Proven:** the pure parts (sanitising, sniffing, caps, eviction plan, HMAC against
+  the RFC 4231 vectors, the `/dl` route including forged/expired/traversal/other-route
+  cases, the upload route) by unit tests; the server crate and the rustpush crate
+  compile and their tests pass on the NAS. **Not proven:** that Apple's MMCS accepts a
+  download or an upload from this phone-only synthetic identity (no iCloud token;
+  `dsid: None`), Live Photo / sticker / voice-message handling, and anything end to
+  end. If MMCS refuses the identity the failure is logged per attachment
+  (`attachment download failed: MMCS ...`) and the text placeholder still goes out.
+
 ### SMS 2FA, no human in the loop (dormant)
 
 The working deployment does not log in to an Apple ID, so this path is not in use. It
