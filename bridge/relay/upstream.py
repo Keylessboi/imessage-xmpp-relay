@@ -5,6 +5,8 @@ Talks to:
 * GET  /health
 * GET  /im/status
 * POST /im/send
+* POST /im/facetime-link
+* POST /im/facetime-call
 * GET  /im/events   (Server-Sent Events)
 
 The event stream reconnects with exponential backoff plus jitter. A non-2xx
@@ -153,6 +155,60 @@ class UpstreamClient:
                     return {"ok": True, "raw": body[:200]}
         except aiohttp.ClientError as exc:
             raise UpstreamError("POST /im/send failed: " + str(exc)) from exc
+
+    async def facetime_link(self) -> str:
+        """POST /im/facetime-link; returns the join URL. Never logged."""
+        return (await self._facetime_post("/im/facetime-link", {}))["url"]
+
+    async def facetime_call(self, to: str, video: bool = True) -> tuple[str, bool, Optional[str]]:
+        """POST /im/facetime-call; returns (url, rang, note). The URL is never logged.
+
+        `rang` is False when the server only managed a plain link (the contact
+        was not rung); `note` says why. A server without the endpoint (404)
+        degrades to the plain link, also with rang False.
+        """
+        try:
+            data = await self._facetime_post(
+                "/im/facetime-call", {"to": to, "video": video}, timeout=75.0
+            )
+        except UpstreamError as exc:
+            if "-> 404" not in str(exc) and "-> 405" not in str(exc):
+                raise
+            return await self.facetime_link(), False, "this server cannot start calls"
+        note = data.get("note")
+        return data["url"], bool(data.get("rang")), note if isinstance(note, str) else None
+
+    async def _facetime_post(
+        self, path: str, payload: dict, timeout: Optional[float] = None
+    ) -> dict:
+        try:
+            async with self.session.post(
+                self.base_url + path,
+                json=payload,
+                # A call is set up server-side (up to 60 s) before it answers.
+                timeout=aiohttp.ClientTimeout(total=timeout or self.timeout),
+            ) as resp:
+                body = await resp.text()
+                parsed: Any = None
+                try:
+                    parsed = json.loads(body) if body else None
+                except ValueError:
+                    pass
+                if resp.status // 100 != 2:
+                    detail = body[:300]
+                    if isinstance(parsed, dict) and parsed.get("error"):
+                        detail = str(parsed["error"])
+                    raise UpstreamError(
+                        "POST " + path + " -> " + str(resp.status) + ": " + detail
+                    )
+                url = parsed.get("url") if isinstance(parsed, dict) else None
+                if not isinstance(url, str) or not url.startswith("https://"):
+                    raise UpstreamError("POST " + path + " returned no link")
+                return parsed
+        except aiohttp.ClientError as exc:
+            raise UpstreamError("POST " + path + " failed: " + str(exc)) from exc
+        except asyncio.TimeoutError as exc:
+            raise UpstreamError("POST " + path + " timed out") from exc
 
     # -- event stream ------------------------------------------------------
 

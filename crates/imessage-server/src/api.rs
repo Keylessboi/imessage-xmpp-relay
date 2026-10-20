@@ -10,6 +10,8 @@
 //! GET  /im/events         -> text/event-stream of the JSON in events.rs
 //! POST /im/register-phone <- {"number":str,"signature":<hex>} -> {"ok":true}
 //! POST /im/facetime-link  <- {"handle":str|null} -> {"ok":true,"url":str}
+//! POST /im/facetime-call  <- {"to":str,"video":bool|null}
+//!                         -> {"ok":true,"url":str,"rang":bool,"note":str|null}
 //! GET  /apns-token        -> {"token":"<hex>"} | 503 {"error":str}
 //!
 //!
@@ -199,6 +201,36 @@ async fn im_facetime_link(
     Ok(Json(json!({ "ok": true, "url": url })))
 }
 
+#[derive(Deserialize)]
+struct FaceTimeCallBody {
+    to: String,
+    #[serde(default)]
+    video: Option<bool>,
+}
+
+/// POST /im/facetime-call - ring `to` on FaceTime and return the owner's join
+/// link. `rang:false` means only a plain link exists and nobody was rung.
+async fn im_facetime_call(
+    State(app): State<Arc<AppState>>,
+    body: Result<Json<FaceTimeCallBody>, JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Json(body) = body
+        .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, format!("invalid body: {e}")))?;
+    if body.to.trim().is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "`to` is required"));
+    }
+    if !app.store.registered() {
+        return Err(ApiError::from(BackendError::not_registered()));
+    }
+    let call = app
+        .backend
+        .facetime_call(body.to.trim(), body.video.unwrap_or(true))
+        .await?;
+    Ok(Json(
+        json!({ "ok": true, "url": call.url, "rang": call.rang, "note": call.note }),
+    ))
+}
+
 async fn im_events(
     State(app): State<Arc<AppState>>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<SseEvent, Infallible>>> {
@@ -273,6 +305,7 @@ pub fn router(app: Arc<AppState>) -> Router {
         .route("/im/events", get(im_events))
         .route("/im/register-phone", post(register_phone))
         .route("/im/facetime-link", post(im_facetime_link))
+        .route("/im/facetime-call", post(im_facetime_call))
         .route("/apns-token", get(apns_token))
         .with_state(app)
 }

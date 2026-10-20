@@ -68,6 +68,18 @@ impl std::fmt::Display for BackendError {
 
 impl std::error::Error for BackendError {}
 
+/// Result of `Backend::facetime_call`.
+#[derive(Debug, Clone)]
+pub struct FaceTimeCall {
+    /// The FaceTime join link for the owner. Never log it.
+    pub url: String,
+    /// True when a FaceTime session was created and the contact invited
+    /// (their devices should ring); false when only a plain link exists.
+    pub rang: bool,
+    /// Human-readable caveat, e.g. why the contact was not rung.
+    pub note: Option<String>,
+}
+
 #[async_trait]
 pub trait Backend: Send + Sync + 'static {
     /// Short name for logs ("stub", "rustpush").
@@ -108,6 +120,15 @@ pub trait Backend: Send + Sync + 'static {
     async fn facetime_link(&self, _handle: Option<&str>) -> Result<String, BackendError> {
         Err(BackendError::unavailable(
             "this backend cannot create FaceTime links",
+        ))
+    }
+
+    /// Start a FaceTime call to `to` (a session that rings the contact) and
+    /// return a join link for the owner. Falls back to a plain link with
+    /// `rang: false` when the session cannot be created. Default: unavailable.
+    async fn facetime_call(&self, _to: &str, _video: bool) -> Result<FaceTimeCall, BackendError> {
+        Err(BackendError::unavailable(
+            "this backend cannot start FaceTime calls",
         ))
     }
 

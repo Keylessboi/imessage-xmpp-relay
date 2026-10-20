@@ -170,6 +170,7 @@ class ComponentTransport:
                 cfg.component_port,
             )
         self.xmpp = xmpp
+        self._calls: Optional[Any] = None  # relay.calls.CallService, see attach_calls
         self._register_handlers()
 
     # -- wiring ------------------------------------------------------------
@@ -183,6 +184,45 @@ class ComponentTransport:
 
     def set_incoming_handler(self, handler: IncomingHandler) -> None:
         self._handler = handler
+
+    def attach_calls(self, calls: Any) -> None:
+        """Enable call-to-FaceTime-link handling (relay.calls.CallService)."""
+        self._calls = calls
+        register = getattr(self.xmpp, "register_handler", None)
+        if register is None:  # injected fakes without a handler registry
+            return
+        from slixmpp.xmlstream.handler import CoroutineCallback as Callback
+        from slixmpp.xmlstream.matcher import MatchXPath
+        from slixmpp.xmlstream.matcher.base import MatcherBase
+
+        ns = getattr(self.xmpp, "default_ns", "jabber:component:accept")
+
+        class _BodylessJingleMessage(MatcherBase):
+            # slixmpp's own "IM" handler only matches messages that carry a
+            # <body/>, so a XEP-0353 <propose/> never reaches the "message"
+            # event. Match body-less messages with a jingle-message child.
+            def match(self, stanza) -> bool:
+                xml = getattr(stanza, "xml", stanza)
+                if xml.tag != "{%s}message" % ns:
+                    return False
+                if xml.find("{%s}body" % ns) is not None:
+                    return False
+                return any(
+                    isinstance(c.tag, str) and c.tag.startswith("{urn:xmpp:jingle-message:0}")
+                    for c in xml
+                )
+
+        register(Callback("facetime jingle message", _BodylessJingleMessage(None),
+                          self._on_jingle_message))
+        register(Callback("facetime jingle iq", MatchXPath(
+            "{%s}iq/{urn:xmpp:jingle:1}jingle" % ns), self._on_jingle_iq))
+        register(Callback("facetime disco info", MatchXPath(
+            "{%s}iq/{http://jabber.org/protocol/disco#info}query" % ns), self._on_disco_iq))
+
+    async def send_raw(self, xml: str) -> None:
+        result = self.xmpp.send_raw(xml)
+        if asyncio.isfuture(result) or asyncio.iscoroutine(result):
+            await result
 
     # -- XmppTransport -----------------------------------------------------
 
@@ -298,6 +338,9 @@ class ComponentTransport:
             )
             return
 
+        if self._calls is not None and await self._calls.on_message(msg):
+            return
+
         to_jid = str(msg["to"] or "")
         handle = jid_to_handle(to_jid, self.cfg.component_domain)
         if not handle:
@@ -327,6 +370,42 @@ class ComponentTransport:
                 to_jid=to_jid,
             )
         )
+
+    async def _on_jingle_message(self, msg) -> None:
+        try:
+            if self._calls is None:
+                return
+            if bare_jid(str(msg["from"] or "")) != self._owner:
+                log.warning(
+                    "DENYING jingle message from a non-owner JID",
+                    event="component_denied",
+                    from_jid=str(msg["from"] or ""),
+                )
+                return
+            await self._calls.on_message(msg)
+        except Exception:  # noqa: BLE001
+            log.exception("ignoring malformed jingle message", event="component_message_error")
+
+    async def _on_jingle_iq(self, iq) -> None:
+        await self._owner_iq(iq, "on_iq")
+
+    async def _on_disco_iq(self, iq) -> None:
+        await self._owner_iq(iq, "on_disco_info")
+
+    async def _owner_iq(self, iq, method: str) -> None:
+        try:
+            if self._calls is None:
+                return
+            if bare_jid(str(iq["from"] or "")) != self._owner:
+                log.warning(
+                    "DENYING iq from a non-owner JID",
+                    event="component_denied",
+                    from_jid=str(iq["from"] or ""),
+                )
+                return
+            await getattr(self._calls, method)(iq)
+        except Exception:  # noqa: BLE001
+            log.exception("ignoring malformed iq", event="component_iq_error")
 
     async def _on_presence_subscribe(self, pres) -> None:
         try:

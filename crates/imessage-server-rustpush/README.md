@@ -271,6 +271,19 @@ Apple's actual response (it rejected the dummy signature and the cert field is
 absent), returned as `400` with Apple's text rather than a generic 500. A real
 `REG-RESP` signature is what is still unproven.
 
+## FaceTime calls (`POST /im/facetime-call`, new, UNTESTED against Apple)
+
+`facetime_call.rs` keeps one long-lived `FTClient` (also used by `/im/facetime-link`),
+feeds it the APS push stream (`FTClient::handle`, needed for QuickRelay allocations),
+sets a local interface, then `create_session(guid, our handle, [contact], video)` and
+`get_session_link(guid)`; the returned link is the owner's way into the ringing call.
+A let-me-in request (the owner opening the link) is auto-approved for the session
+started last, and for nothing else. On any failure (60 s cap) the endpoint falls back
+to `get_link_for_usage` and answers `rang:false` with the reason. It compiles (see the
+branch report) but has never run: whether Apple accepts `create_session` / an
+`Invitation` from the phone-only synthetic identity, and whether the contact's phone
+rings, is unknown. The link is never logged.
+
 ## FaceTime links and group replies (2026-10-19)
 
 Two additive capabilities, both wired into the same rustpush identity the relay

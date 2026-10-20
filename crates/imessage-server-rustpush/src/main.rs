@@ -6,6 +6,7 @@
 //! for config + endpoints.
 
 mod backend;
+mod facetime_call;
 mod sentlog;
 mod sms2fa;
 

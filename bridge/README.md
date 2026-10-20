@@ -167,6 +167,48 @@ listen:
 * The component domain must not be the owner's domain; config refuses a
   `COMPONENT_OWNER` inside `COMPONENT_DOMAIN` (that would loop).
 
+### Calls: decline the XMPP call, ring FaceTime (`relay/calls.py`)
+
+Component mode only, owner only. When the owner starts an audio/video call to a
+contact JID, the bridge declines it and asks the server to start a FaceTime call
+to that contact (`POST /im/facetime-call`, the contact's devices ring); it posts
+`FaceTime: <url>` into the same chat, from the contact's JID, so the owner can
+open the link in a browser and join. The link goes to the owner only and is never
+sent over iMessage by the bridge. If the server cannot start the call it falls
+back to a plain link and the message says `The contact was NOT rung`. Also: the
+owner sending `facetime` (or `/facetime`) in a contact's chat does the same; sent
+to the bridge JID itself it yields a plain link (nobody to ring). At most 2
+requests per minute; links are never logged.
+
+Standard XEPs only: 0353 (Jingle Message Initiation), 0166/0167 (Jingle, RTP), 0030
+(disco#info, so clients show the call button).
+
+What the clients send (evidence): the monocles chat source on Codeberg
+(`JingleConnectionManager.java`, `MessageGenerator.java`, same code as
+Conversations) opens a call with a type=chat `<message>` carrying
+`<propose xmlns='urn:xmpp:jingle-message:0' id=SID>` with one
+`<description xmlns='urn:xmpp:jingle:apps:rtp:1' media='audio|video'/>` per medium,
+plus `<request xmlns='urn:xmpp:receipts'/>` and `<store xmlns='urn:xmpp:hints'/>`. It
+sends the Jingle `session-initiate` IQ only after a directly addressed `<proceed>`.
+A directly addressed `<reject>` ends the call UI (`DECLINED_OR_BUSY`), so the bridge
+sends `<reject id=SID><description xmlns=rtp/></reject>` + `<store/>` to the
+initiator's FULL JID, from the called JID, exactly as Conversations itself rejects.
+The bridge never sends `proceed`; a direct `session-initiate` (other clients) is
+answered with an IQ result and `session-terminate` / `<decline/>`.
+
+Note a slixmpp quirk found while testing: its message event only fires for
+stanzas with a `<body>`, so a body-less `<propose>` never reaches the normal
+`message` handler. `ComponentTransport.attach_calls` registers its own matcher.
+For debugging, run with `LOG_LEVEL=DEBUG`: the bridge logs `jingle_message` /
+`jingle_iq` with the stanza kind and media only (no content), so the real stanza a
+client sends can be compared with the above.
+
+Not proven: no real client was connected (stanzas are real slixmpp stanzas built to
+the documented shape), whether the call button appears for the contact JIDs
+(clients check the contact's presence/disco; our contacts answer disco#info for the
+bare JID but send no XEP-0115 caps), and the server side: see
+`crates/imessage-server-rustpush/README.md` (FaceTime calls).
+
 ### OMEMO 2 end-to-end encryption
 
 `XMPP_OMEMO=1` encrypts **1:1** XMPP messages with OMEMO in the

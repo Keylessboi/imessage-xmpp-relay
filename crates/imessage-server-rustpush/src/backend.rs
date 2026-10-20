@@ -48,7 +48,7 @@ use rustpush::{
     Message, MessageInst, MessageType, NormalMessage, OSConfig, RelayConfig, MADRID_SERVICE,
 };
 
-use imessage_server::backend::{Backend, BackendError, LoginStatus};
+use imessage_server::backend::{Backend, BackendError, FaceTimeCall, LoginStatus};
 use imessage_server::config::Config;
 use imessage_server::events::{
     chat_guid_for, normalize_handle, strip_handle, EventBus, MessageEvent,
@@ -628,6 +628,39 @@ impl RustpushBackend {
     /// `handle` is only context: it selects which of our handles is the origin
     /// when it names one of them.
     async fn facetime_link_inner(&self, handle: Option<&str>) -> Result<String> {
+        let (engine, my_handle) = self.facetime_engine(handle).await?;
+        engine
+            .ft()
+            .get_link_for_usage(&my_handle, FACETIME_LINK_USAGE)
+            .await
+            .map_err(|e| anyhow!("FaceTime link request for {my_handle} failed: {e}"))
+    }
+
+    /// Ring `to` on FaceTime and return the owner's join link (see
+    /// `facetime_call.rs`; unproven against Apple with a synthetic identity).
+    /// Any failure falls back to the plain link with `rang: false`.
+    async fn facetime_call_inner(&self, to: &str, video: bool) -> Result<FaceTimeCall> {
+        let (engine, my_handle) = self.facetime_engine(None).await?;
+        let peer = crate::facetime_call::ids_handle(to);
+        match engine.place_call(&my_handle, &peer, video).await {
+            Ok(url) => Ok(FaceTimeCall { url, rang: true, note: None }),
+            Err(e) => {
+                tracing::warn!("FaceTime call to the contact failed, falling back to a plain link: {e:#}");
+                let url = self.facetime_link_inner(None).await?;
+                Ok(FaceTimeCall {
+                    url,
+                    rang: false,
+                    note: Some(format!("the contact was NOT rung: {e:#}")),
+                })
+            }
+        }
+    }
+
+    /// The shared FaceTime engine plus the handle of ours it should act as.
+    async fn facetime_engine(
+        &self,
+        handle: Option<&str>,
+    ) -> Result<(Arc<crate::facetime_call::CallEngine>, String)> {
         let guard = self.running.read().await;
         let running = guard
             .as_ref()
@@ -661,7 +694,7 @@ impl RustpushBackend {
             .unwrap_or_default();
 
         let store = self.store.clone();
-        let facetime = rustpush::facetime::FTClient::new(
+        let engine = crate::facetime_call::engine(
             ft_state,
             Box::new(move |state: &rustpush::facetime::FTState| persist_facetime(&store, state)),
             running.connection.clone(),
@@ -669,11 +702,7 @@ impl RustpushBackend {
             running.config.clone(),
         )
         .await;
-
-        facetime
-            .get_link_for_usage(&my_handle, FACETIME_LINK_USAGE)
-            .await
-            .map_err(|e| anyhow!("FaceTime link request for {my_handle} failed: {e}"))
+        Ok((engine, my_handle))
     }
 }
 
@@ -723,6 +752,12 @@ impl Backend for RustpushBackend {
         self.facetime_link_inner(handle)
             .await
             // Apple's own error text travels intact in the message.
+            .map_err(|e| BackendError::new(StatusCode::BAD_GATEWAY, format!("{e:#}")))
+    }
+
+    async fn facetime_call(&self, to: &str, video: bool) -> Result<FaceTimeCall, BackendError> {
+        self.facetime_call_inner(to, video)
+            .await
             .map_err(|e| BackendError::new(StatusCode::BAD_GATEWAY, format!("{e:#}")))
     }
 
