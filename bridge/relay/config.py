@@ -21,6 +21,37 @@ class ConfigError(Exception):
     """Raised for missing or contradictory environment variables."""
 
 
+# Secrets that may be supplied as a file instead of an environment variable. Environment
+# variables show up in process listings, crash reports and `kubectl describe`; a mounted file
+# (Kubernetes Secret volume, Docker secret) does not. Set NAME_FILE=/path instead of NAME.
+_FILE_SECRETS = ("XMPP_PASSWORD", "COMPONENT_SECRET")
+
+
+def _resolve_secret_files(e: dict[str, str]) -> None:
+    """Fill ``e[NAME]`` from the file named by ``e[NAME_FILE]``, in place.
+
+    Fails closed: a missing/unreadable file or setting both forms is a ConfigError, and the
+    message never contains the file's contents. One trailing newline is stripped, because
+    that is how editors and ``echo`` write the file, never part of the secret.
+    """
+    for name in _FILE_SECRETS:
+        path = (e.get(name + "_FILE") or "").strip()
+        if not path:
+            continue
+        if (e.get(name) or "").strip():
+            raise ConfigError(f"set either {name} or {name}_FILE, not both")
+        try:
+            with open(path, encoding="utf-8") as fh:
+                value = fh.read()
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ConfigError(f"{name}_FILE={path} is not readable ({type(exc).__name__})") from None
+        if value.endswith("\n"):
+            value = value[:-1]
+        if not value.strip():
+            raise ConfigError(f"{name}_FILE={path} is empty")
+        e[name] = value
+
+
 def _bool(value: Optional[str]) -> bool:
     return (value or "").strip().lower() in ("1", "true", "yes", "on")
 
@@ -216,6 +247,7 @@ class Config:
         from .models import bare_jid
 
         e = dict(os.environ if env is None else env)
+        _resolve_secret_files(e)
         mode = (e.get("XMPP_MODE") or "client").strip().lower()
         if mode not in ("client", "component"):
             raise ConfigError(

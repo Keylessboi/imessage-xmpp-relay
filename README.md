@@ -43,6 +43,8 @@ make those work are described below.
 | [bridge](bridge/README.md) | XMPP <-> iMessage bridge, client account or XEP-0114 component | 106 tests green; component mode **proven against ejabberd 26.9.0**; OMEMO implemented, not client-tested |
 | [vendor/open-absinthe](vendor/open-absinthe/) | Emulated Apple NAC binary (Unicorn) — **vendored**, see below | AGPL-3.0, in-tree |
 | [deploy/docker](deploy/docker/relay.Dockerfile) | Container image for the relay | Written, not built |
+| [deploy/docker/server.Dockerfile](deploy/docker/server.Dockerfile) | Container image for `imessage-server-rustpush` (the :8790 server). Stage the build context with [scripts/stage-build-context.sh](scripts/stage-build-context.sh), which keeps every secret out of it | Built on a homelab node, 2026-10-20 |
+| [bridge/Dockerfile](bridge/Dockerfile) | Container image for the XMPP bridge; secrets can come from files (`COMPONENT_SECRET_FILE`, `XMPP_PASSWORD_FILE`) | Built on a homelab node, 2026-10-20 |
 | [deploy/gitops](deploy/gitops/README.md) | Example Kubernetes manifests for an ArgoCD-managed cluster | `kubectl kustomize` renders clean; **not applied** |
 | [aka-oracle](aka-oracle/) | Android helper app: EAP-AKA over the real SIM | Working (SIM AKA proven) |
 
@@ -342,10 +344,17 @@ depends on the Apple ID login completing.
 - **Group reply is untested live.** There is no real inbound group message, so there
   is no real `gid` to reply into. An inbound group text to the number is the
   acceptance test.
-- **Nothing is deployed to a cluster.** It runs on a single development host: two systemd user units
-  (`imessage-relay.service` and `imessage-bridge.service`) plus one Docker container
-  (`registration-relay`). [deploy/gitops](deploy/gitops/README.md) renders, but has
-  never been applied.
+- **Deployed to a k3s cluster on 2026-10-20** (server + bridge in one pod, the IDS registration on
+  an encrypted NAS volume, the bridge linked to an ejabberd component host over XEP-0114). The
+  server restored the registration (`registered: true`) and connected to Apple's push service from
+  the cluster; federated message traffic through the new path has **not** been exercised yet.
+  The manifests live in the cluster's GitOps repo, not here. Only the `registration-relay`
+  container (re-registration) still runs on the development host, and the two systemd units there
+  are stopped, because the registration must be live in exactly one place.
+  [deploy/gitops](deploy/gitops/README.md) is the older example for the validation-data relay only.
+- **Moving a service off a workstation hides requirements.** The server insists on an Apple ID at
+  boot (a placeholder `gsa.plist` satisfies it; the phone-only number never logs in), and the APNs
+  bag is fetched over plain HTTP on port 80, which a default-deny egress policy blocks.
 - **OMEMO 2 has not been used against a real XMPP client** (Conversations/Dino/Gajim)
   or a live server; it is proven only between in-process sessions.
 - **The iPhone X battery is end-of-life.** Registration works today, but a replacement

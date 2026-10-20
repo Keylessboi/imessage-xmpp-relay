@@ -94,72 +94,163 @@ fn anisette_url() -> String {
 /// `get-validation-data` with its genuine NAC blob, so IDS/APS see an iPhone
 /// instead of the Mac identity seeded into hwconfig.plist.
 ///
-/// Returns `None` when `REGISTRATION_RELAY_URL`/`REGISTRATION_RELAY_CODE` are
-/// not set (the MacOSConfig fallback) or when the relay cannot be reached.
-async fn relay_config() -> Option<Arc<dyn OSConfig>> {
-    let host = std::env::var("REGISTRATION_RELAY_URL")
+/// Returns `None` when neither the relay nor a cached identity is usable (the
+/// MacOSConfig fallback). The first successful `get-version-info` is persisted
+/// to `<data_dir>/relay-identity.json`; when the relay is unset or does not
+/// answer, that cached identity is used so boot needs neither relay nor phone.
+async fn relay_config(data_dir: &Path) -> Option<Arc<dyn OSConfig>> {
+    let host_env = std::env::var("REGISTRATION_RELAY_URL")
         .ok()
         .map(|raw| raw.trim().trim_end_matches('/').to_string())
-        .filter(|raw| !raw.is_empty())?;
-    let code = match std::env::var("REGISTRATION_RELAY_CODE") {
-        Ok(raw) if !raw.trim().is_empty() => raw.trim().to_string(),
-        _ => {
+        .filter(|raw| !raw.is_empty());
+    let code_env = std::env::var("REGISTRATION_RELAY_CODE")
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty());
+
+    // The (Versions, host, code, udid) -> config constructor; a closure so the
+    // private `Versions` type is inferred rather than named.
+    let make = |version, host: String, code: String, udid: String| -> Arc<dyn OSConfig> {
+        Arc::new(RelayConfig {
+            version,
+            icloud_ua: "com.apple.iCloudHelper/282 CFNetwork/1408.0.4 Darwin/22.5.0".to_string(),
+            aoskit_version: "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string(),
+            dev_uuid: uuid::Uuid::new_v4().to_string(),
+            protocol_version: 1640,
+            host,
+            code,
+            beeper_token: None,
+            udid: Some(udid),
+        })
+    };
+
+    if let Some(host) = host_env.clone() {
+        if let Some(code) = code_env.clone() {
+            let beeper_token: Option<String> = None;
+            match RelayConfig::get_versions(&host, &code, &beeper_token).await {
+                Ok(version) => {
+                    // Versions keeps its fields private, so read the values back through a
+                    // plist round-trip. unique_device_id is this device's UDID (X-Client-UDID);
+                    // a fresh one is only a last-resort fallback if that shape ever changes.
+                    let info = plist::to_value(&version)
+                        .ok()
+                        .and_then(|value| value.into_dictionary());
+                    let field = |key: &str| {
+                        info.as_ref()
+                            .and_then(|dict| dict.get(key))
+                            .and_then(|value| value.as_string())
+                            .unwrap_or("")
+                            .to_string()
+                    };
+                    let udid = match field("unique_device_id") {
+                        value if !value.is_empty() => value,
+                        _ => uuid::Uuid::new_v4().to_string().to_uppercase(),
+                    };
+
+                    tracing::info!(
+                        "device identity: registration relay {host} -> {} {} (build {}), serial {}, udid {}",
+                        field("hardware_version"),
+                        field("software_version"),
+                        field("software_build_id"),
+                        field("serial_number"),
+                        udid,
+                    );
+
+                    match serde_json::to_value(&version) {
+                        Ok(value) => {
+                            if let Err(e) = save_relay_identity(data_dir, &value, &udid) {
+                                tracing::warn!("could not persist the relay device identity: {e:#}");
+                            }
+                        }
+                        Err(e) => tracing::warn!("could not serialise the relay device identity: {e}"),
+                    }
+                    return Some(make(version, host, code, udid));
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "registration relay {host} did not answer get-version-info: {e}; \
+                         falling back to the Mac identity"
+                    );
+                }
+            }
+        } else {
             tracing::error!(
                 "REGISTRATION_RELAY_URL is set but REGISTRATION_RELAY_CODE is not; \
                  falling back to the Mac identity"
             );
-            return None;
         }
-    };
+    }
 
-    let beeper_token: Option<String> = None;
-    let version = match RelayConfig::get_versions(&host, &code, &beeper_token).await {
-        Ok(version) => version,
-        Err(e) => {
-            tracing::error!(
-                "registration relay {host} did not answer get-version-info: {e}; \
-                 falling back to the Mac identity"
-            );
-            return None;
-        }
-    };
-
-    // Versions keeps its fields private, so read the values back through a
-    // plist round-trip. unique_device_id is this device's UDID (X-Client-UDID);
-    // a fresh one is only a last-resort fallback if that shape ever changes.
-    let info = plist::to_value(&version).ok().and_then(|value| value.into_dictionary());
-    let field = |key: &str| {
-        info.as_ref()
-            .and_then(|dict| dict.get(key))
-            .and_then(|value| value.as_string())
+    // Relay unset or unavailable: reuse the identity it gave us the first time.
+    let cached = load_relay_identity(data_dir)?;
+    let text = |key: &str| {
+        cached
+            .versions
+            .get(key)
+            .and_then(|value| value.as_str())
             .unwrap_or("")
             .to_string()
     };
-    let udid = match field("unique_device_id") {
-        value if !value.is_empty() => value,
-        _ => uuid::Uuid::new_v4().to_string().to_uppercase(),
-    };
-
     tracing::info!(
-        "device identity: registration relay {host} -> {} {} (build {}), serial {}, udid {}",
-        field("hardware_version"),
-        field("software_version"),
-        field("software_build_id"),
-        field("serial_number"),
-        udid,
+        "device identity: cached (registration relay unavailable) -> {} {}",
+        text("hardware_version"),
+        text("software_version"),
     );
-
-    Some(Arc::new(RelayConfig {
+    let version = serde_json::from_value(cached.versions.clone()).ok()?;
+    Some(make(
         version,
-        icloud_ua: "com.apple.iCloudHelper/282 CFNetwork/1408.0.4 Darwin/22.5.0".to_string(),
-        aoskit_version: "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string(),
-        dev_uuid: uuid::Uuid::new_v4().to_string(),
-        protocol_version: 1640,
-        host,
-        code,
-        beeper_token: None,
-        udid: Some(udid),
-    }))
+        host_env.unwrap_or_default(),
+        code_env.unwrap_or_default(),
+        cached.udid,
+    ))
+}
+
+const RELAY_IDENTITY_FILE: &str = "relay-identity.json";
+
+/// What `relay-identity.json` holds: the relay's `Versions` (as JSON, since the
+/// type is private to rustpush) and the device UDID. Not a credential.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CachedRelayIdentity {
+    versions: serde_json::Value,
+    udid: String,
+}
+
+/// Atomically write `<data_dir>/relay-identity.json` with mode 0600.
+fn save_relay_identity(data_dir: &Path, versions: &serde_json::Value, udid: &str) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let body = serde_json::to_vec_pretty(&CachedRelayIdentity {
+        versions: versions.clone(),
+        udid: udid.to_string(),
+    })?;
+    let path = data_dir.join(RELAY_IDENTITY_FILE);
+    let tmp = data_dir.join(format!("{RELAY_IDENTITY_FILE}.tmp"));
+    let _ = std::fs::remove_file(&tmp);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .with_context(|| format!("creating {}", tmp.display()))?;
+    file.write_all(&body)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, &path).with_context(|| format!("renaming into {}", path.display()))?;
+    Ok(())
+}
+
+/// Read `<data_dir>/relay-identity.json`; `None` if missing or unparseable.
+fn load_relay_identity(data_dir: &Path) -> Option<CachedRelayIdentity> {
+    let path = data_dir.join(RELAY_IDENTITY_FILE);
+    let bytes = std::fs::read(&path).ok()?;
+    match serde_json::from_slice::<CachedRelayIdentity>(&bytes) {
+        Ok(cached) => Some(cached),
+        Err(e) => {
+            tracing::warn!("ignoring unreadable {}: {e}", path.display());
+            None
+        }
+    }
 }
 
 /// Build the anisette provider with a configurable URL.
@@ -317,7 +408,7 @@ impl RustpushBackend {
         // REGISTRATION_RELAY_CODE are set, else the Mac identity from
         // hwconfig.plist. The relay path makes IDS see an iPhone10,6 rather than
         // the Mac profile, which is what the jailbroken-X bridge is for.
-        let macos_config: Arc<dyn OSConfig> = match relay_config().await {
+        let macos_config: Arc<dyn OSConfig> = match relay_config(&data_dir).await {
             Some(relay) => relay,
             None => Arc::new(
                 plist::from_bytes::<MacOSConfig>(&self.config.hwconfig_raw).context(
@@ -1694,6 +1785,43 @@ async fn receive_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relay_identity_round_trip() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "relay-identity-test-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        assert!(load_relay_identity(&dir).is_none());
+
+        let versions = serde_json::json!({
+            "hardware_version": "iPhone10,6",
+            "software_version": "16.7.10",
+        });
+        save_relay_identity(&dir, &versions, "UDID-1").unwrap();
+        // A second save replaces the first atomically.
+        save_relay_identity(&dir, &versions, "UDID-2").unwrap();
+
+        let path = dir.join(RELAY_IDENTITY_FILE);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert!(!dir.join(format!("{RELAY_IDENTITY_FILE}.tmp")).exists());
+
+        let cached = load_relay_identity(&dir).expect("cached identity");
+        assert_eq!(cached.udid, "UDID-2");
+        assert_eq!(cached.versions, versions);
+
+        std::fs::write(&path, b"{ not json").unwrap();
+        assert!(load_relay_identity(&dir).is_none());
+        std::fs::write(&path, b"{\"versions\": 1}").unwrap();
+        assert!(load_relay_identity(&dir).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn reply_to_wire_form() {
