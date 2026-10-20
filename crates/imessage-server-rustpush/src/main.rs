@@ -6,6 +6,7 @@
 //! for config + endpoints.
 
 mod backend;
+mod sentlog;
 mod sms2fa;
 
 use std::sync::Arc;

@@ -26,6 +26,7 @@
 //!     backoff (IMESSAGE_LOGIN_RETRY_SECS, default 1800 = 30 min, doubling to a
 //!     3600 s cap; 0 disables) instead of being fatal at boot.
 
+use crate::sentlog::{SentLog, SentRecord};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -553,24 +554,18 @@ impl RustpushBackend {
             )
         })?;
 
-        let handles = client.identity.get_handles().await;
-        let sender = handles
-            .first()
-            .cloned()
-            .ok_or_else(|| anyhow!("no IDS handle is registered"))?;
-
-        let (reply_guid, reply_part) = split_reply(reply_to);
-        let mut normal = NormalMessage::new(text.to_string(), MessageType::IMessage);
-        normal.reply_guid = reply_guid;
-        normal.reply_part = reply_part;
-
-        let mut inst = MessageInst::new(conversation, &sender, Message::Message(normal));
-
-        let guid = inst.id.clone();
-        client
-            .send(&mut inst)
-            .await
-            .map_err(|e| anyhow!("send failed: {e}"))?;
+        let chat_guid = conversation.sender_guid.clone();
+        let rec = SentRecord {
+            conversation: conversation.clone(),
+            text: text.to_string(),
+            reply_to: reply_to.clone(),
+            chat_guid,
+            retried: false,
+        };
+        let guid = send_text(client, conversation, text, reply_to).await?;
+        if let Ok(mut log) = SENT.lock() {
+            log.record(guid.clone(), rec);
+        }
         Ok(guid)
     }
 
@@ -1687,6 +1682,63 @@ fn remember_chat(chats: &Chats, store: &StateStore, inst: &MessageInst) {
     }
 }
 
+/// Recent outbound sends, consulted when an IDS error arrives for one of them.
+/// Process-global so the push loop needs no extra plumbing.
+static SENT: std::sync::LazyLock<std::sync::Mutex<SentLog>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Build and send one text through `client`; returns the new message guid.
+async fn send_text(
+    client: &IMClient,
+    conversation: ConversationData,
+    text: &str,
+    reply_to: Option<String>,
+) -> Result<String> {
+    let handles = client.identity.get_handles().await;
+    let sender = handles
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow!("no IDS handle is registered"))?;
+
+    let (reply_guid, reply_part) = split_reply(reply_to);
+    let mut normal = NormalMessage::new(text.to_string(), MessageType::IMessage);
+    normal.reply_guid = reply_guid;
+    normal.reply_part = reply_part;
+
+    let mut inst = MessageInst::new(conversation, &sender, Message::Message(normal));
+    let guid = inst.id.clone();
+    client
+        .send(&mut inst)
+        .await
+        .map_err(|e| anyhow!("send failed: {e}"))?;
+    Ok(guid)
+}
+
+/// An IDS error (command 120) for a message we sent. rustpush has already
+/// invalidated the identity cache for messageprotection errors; resend once.
+async fn handle_ids_error(client: &IMClient, e: &rustpush::ErrorMessage) {
+    tracing::warn!(
+        guid = %e.for_uuid,
+        status = e.status,
+        status_str = %e.status_str,
+        "ids error for sent message"
+    );
+    let rec = SENT
+        .lock()
+        .ok()
+        .and_then(|mut log| log.take_retry(&e.for_uuid, &e.status_str));
+    let Some(rec) = rec else { return };
+    match send_text(client, rec.conversation.clone(), &rec.text, rec.reply_to.clone()).await {
+        Ok(new_guid) => {
+            tracing::warn!(old_guid = %e.for_uuid, new_guid = %new_guid, "resending after identity refresh");
+            if let Ok(mut log) = SENT.lock() {
+                log.record_retry(new_guid, rec);
+            }
+        }
+        Err(err) => tracing::warn!(old_guid = %e.for_uuid, "resend failed: {err}"),
+    }
+}
+
 /// Turn an inbound MessageInst into the frozen SSE shape. Non-text messages
 /// (receipts, typing, profile updates, errors) are not surfaced yet.
 fn message_event(inst: &MessageInst) -> Option<MessageEvent> {
@@ -1766,6 +1818,9 @@ async fn receive_loop(
                     // Learn the conversation before publishing it, so a
                     // reply can address this chat_guid immediately.
                     remember_chat(&chats, &store, &inst);
+                    if let Message::Error(e) = &inst.message {
+                        handle_ids_error(&client, e).await;
+                    }
                     if let Some(event) = message_event(&inst) {
                         tracing::info!(guid = %event.guid, from = %event.from, "inbound message");
                         bus.message(event);
