@@ -71,6 +71,7 @@ Secrets are never logged. `state.plist` and the keystore are written mode `0600`
 | POST | `/im/send` | body `{"to":"+15551234567","text":"hi","reply_to":null}` → `{"ok":true,"guid":"..."}`; `to` may be omitted when `chat_guid` names an inbound group; non-2xx → `{"error":"..."}` |
 | POST | `/im/facetime-link` | body `{"handle":"+15551234567"}` → `{"ok":true,"url":"https://facetime.apple.com/join#..."}`; the handle is context only |
 | GET | `/im/events` | `text/event-stream`, one JSON object per `data:` line |
+| POST | `/im/read`, `/im/typing`, `/im/react`, `/im/edit`, `/im/unsend` | additive. Body names the chat (`to` or `chat_guid`) plus `guid` (read/react/edit/unsend), `typing` (default true), `reaction` heart\|like\|dislike\|laugh\|emphasize\|question\|emoji + `emoji`/`enable`/`part`/`to_text` (react), `text` (edit), `part`. → `{"ok":true,"guid":"..."}`. Stub backend: 503. Extra SSE events on `/im/events`: `delivered`, `read`, `typing`, `reaction`, `edit`, `unsend`, and `message_meta` (reply target + attachments, published just before its `message`); `ready` and `message` are unchanged. Compiled and unit-tested only, never run against Apple. |
 | POST | `/im/register-phone` | body `{"number":"+1555...","signature":"<hex from REG-RESP>"}` → `{"ok":true,"handle":"tel:+1555..."}` |
 | GET | `/apns-token` | `{"token":"<hex>"}`, or 503 while APS has no token |
 

@@ -167,6 +167,47 @@ listen:
 * The component domain must not be the owner's domain; config refuses a
   `COMPONENT_OWNER` inside `COMPONENT_DOMAIN` (that would loop).
 
+### Message features (component mode only)
+
+Standard XEPs only. Everything below is additive: plain text relaying is
+unchanged, and in client mode (no per-peer JIDs, no stanza extras) these events
+are ignored and attachments still become readable text.
+
+| iMessage | XMPP | XEP |
+|---|---|---|
+| inbound message | stanza `id` = iMessage guid, plus `<request/>` and `<markable/>`, `<store/>` hint | 0184, 0333, 0334 |
+| delivered / read (for a message the owner sent) | `<received id=/>` / `<displayed id=/>` from the peer JID, only if the owner's stanza asked | 0184, 0333 |
+| typing on / off | `<composing/>` / `<active/>` from the peer JID (1:1 only) | 0085 |
+| tapback (add/remove) | `<reactions id=>` carrying the peer's full emoji set for that message, with a `Loved "..."` fallback body | 0444, 0428 |
+| reply to a known message | `<reply id= to=>` with a `> quoted` fallback range | 0461, 0428 |
+| edit | `<replace id=>` correction (part 0) | 0308 |
+| unsend | `<retract id=>` with fallback body | 0424, 0428 |
+| sticker / attachment | text placeholder `[sticker: name]` / `[attachment: name (mime)]`; bytes are not fetched | - |
+
+| XMPP (owner) | iMessage | XEP |
+|---|---|---|
+| `<displayed id=>` for a relayed message | `POST /im/read` (once per message) | 0333 |
+| `<composing/>` / paused, active, ... (no body) | `POST /im/typing` (debounced) | 0085 |
+| `<reactions id=>` | one `POST /im/react` per added/removed emoji; the six tapback emoji map to tapbacks, anything else to an emoji tapback | 0444 |
+| `<reply id=>` | `reply_to` = the referenced guid (fallback text stripped) | 0461, 0428 |
+| `<replace id=>` on a message the bridge sent | `POST /im/edit` | 0308 |
+| `<retract id=>` on a message the bridge sent | `POST /im/unsend` | 0424 |
+
+Config: `RELAY_SEND_READ_RECEIPTS` (default on) and `RELAY_SEND_TYPING`
+(default on) switch the two privacy-relevant outbound signals off.
+
+Limits worth knowing: the guid <-> XMPP id map is in memory and bounded, so
+after a bridge restart a reaction/reply to an older inbound message still works
+(its id is the guid) but an edit/unsend/receipt for an older message the owner
+sent does not (the owner is told); group conversations get labelled text
+notices instead of per-peer reactions/receipts/typing; an iMessage edit of a
+non-first part or an unsend of a non-first part is a text notice; XEP-0424
+legacy `urn:xmpp:message-retract:0` and XEP-0461 replies to messages the bridge
+never saw are not specially handled. The server publishes a `message_meta`
+event (reply target, attachment list) just before the `message` it describes;
+the bridge needs a server that does so for reply/placeholder detail and
+degrades to plain text without it.
+
 ### OMEMO 2 end-to-end encryption
 
 `XMPP_OMEMO=1` encrypts **1:1** XMPP messages with OMEMO in the
@@ -307,6 +348,14 @@ timeout 40 .venv/bin/python smoke_real_transport.py   # prints SMOKE_OK
 ```
 
 ## What is NOT proven
+
+* **Message features (receipts, typing, reactions, replies, edits, retractions,
+  placeholders) are covered by unit tests with a fake transport and a mock
+  upstream only.** No stanza was sent to a real XMPP server or client, and no
+  such event was received from real Apple. Which of Conversations/Dino/Gajim/
+  Monal render each XEP is unverified, and the Rust side was compile- and
+  unit-tested on the NAS but never run against Apple (rustpush send paths for
+  read/typing/react/edit/unsend are unexercised).
 
 * **Client mode was not run against a live server.** No stanza was sent from a
   logged-in bot account, so login, STARTTLS, roster, `xep_0045`

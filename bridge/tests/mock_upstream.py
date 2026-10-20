@@ -24,6 +24,8 @@ class MockUpstream:
         self.queue: asyncio.Queue = asyncio.Queue()
         self.sent: list[dict] = []
         self.requests: Counter = Counter()
+        self.actions: list[tuple[str, dict]] = []  # (kind, body) for /im/read|typing|react|edit|unsend
+        self.action_status = 200
         self.health_payload: dict = {"ok": True, "registered": True}
         self.status_payload: dict = {
             "registered": True,
@@ -47,7 +49,20 @@ class MockUpstream:
         app.router.add_get("/im/status", self._status)
         app.router.add_post("/im/send", self._send)
         app.router.add_get("/im/events", self._events)
+        for kind in ("read", "typing", "react", "edit", "unsend"):
+            app.router.add_post("/im/" + kind, self._make_action(kind))
         return app
+
+    def _make_action(self, kind: str):
+        async def handler(request: web.Request) -> web.Response:
+            self.requests["/im/" + kind] += 1
+            payload = await request.json()
+            self.actions.append((kind, payload))
+            if self.action_status != 200:
+                return web.json_response({"error": "nope"}, status=self.action_status)
+            return web.json_response({"ok": True, "guid": payload.get("guid") or "action-guid"})
+
+        return handler
 
     async def _health(self, request: web.Request) -> web.Response:
         self.requests["/health"] += 1

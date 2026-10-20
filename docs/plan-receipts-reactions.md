@@ -1,6 +1,6 @@
 # Plan: delivery/read receipts, reactions and stickers
 
-Status 2026-10-20: **design only, no code written.** Findings are from reading rustpush and this repo.
+Status 2026-10-20: **implemented on `feat/msgfeatures-impl` (unit-tested, never run against Apple or a real XMPP client); see bridge/README.md "Message features".** Originally design only. Findings are from reading rustpush and this repo.
 The server (`message_event()` in `crates/imessage-server-rustpush/src/backend.rs`) currently surfaces only
 text; receipts, typing, profile updates and errors are dropped. Stickers/attachments arrive as a U+FFFC
 placeholder in the text.
@@ -40,3 +40,13 @@ placeholder in the text.
   readable fallback (`[sticker: name]`). Outbound stickers/attachments (MMCS upload from a phone-only
   identity) were not investigated.
 - Receipts only for messages the owner's client marked `markable` / requested a receipt for.
+
+## As built (feat/msgfeatures-impl)
+
+- Server: `message` is untouched. New SSE events `delivered`, `read`, `typing`, `reaction`, `edit`, `unsend`
+  and `message_meta` (published just before its `message`; carries reply target and attachment list).
+  New `POST /im/read|typing|react|edit|unsend` (body: `to` or `chat_guid` plus per-endpoint fields);
+  `Backend::send_action` defaults to unavailable. Mapping lives in `crates/imessage-server-rustpush/src/msgfeatures.rs`.
+- Bridge: `relay/xep.py` (stanza building/parsing), `relay/rich.py` (id map, reaction sets, flows).
+- Not done: real attachment bytes, explicit iMessage `Delivered` receipts (IDS sends them itself), SMS-service
+  messages, group per-peer features.
