@@ -7,6 +7,7 @@
 
 mod backend;
 mod msgfeatures;
+mod groups;
 mod sentlog;
 mod sms2fa;
 

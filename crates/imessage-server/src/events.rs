@@ -113,6 +113,8 @@ pub enum Event {
     Unsend(UnsendEvent),
     #[serde(rename = "message_meta")]
     MessageMeta(MessageMetaEvent),
+    /// Group rename / member change / icon change (additive; see groups.rs).
+    Group(crate::groups::GroupEvent),
 }
 
 /// Fan-out bus feeding every connected `/im/events` listener.
@@ -148,6 +150,10 @@ impl EventBus {
 
     pub fn message(&self, message: MessageEvent) {
         self.publish(Event::Message(message));
+    }
+
+    pub fn group(&self, event: crate::groups::GroupEvent) {
+        self.publish(Event::Group(event));
     }
 }
 

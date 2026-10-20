@@ -138,6 +138,24 @@ pub trait Backend: Send + Sync + 'static {
         ))
     }
 
+    /// Groups the backend knows (additive; see `groups.rs`). Default: none.
+    async fn list_groups(&self) -> Result<Vec<crate::groups::GroupInfo>, BackendError> {
+        Err(BackendError::unavailable(
+            "this backend does not manage group chats",
+        ))
+    }
+
+    /// Create / rename / change members of / leave a group (additive; see
+    /// `groups.rs`). Only called when registered.
+    async fn group_op(
+        &self,
+        _op: crate::groups::GroupOp,
+    ) -> Result<crate::groups::GroupResult, BackendError> {
+        Err(BackendError::unavailable(
+            "this backend cannot manage group chats",
+        ))
+    }
+
     /// Mint (or reuse) an Apple FaceTime join link from the registered IDS
     /// identity. Optional `handle` is context only. Default: unavailable.
     async fn facetime_link(&self, _handle: Option<&str>) -> Result<String, BackendError> {

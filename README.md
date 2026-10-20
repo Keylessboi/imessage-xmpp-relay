@@ -322,6 +322,10 @@ depends on the Apple ID login completing.
   identity, with no Apple ID. The link is persisted and reused
   (`state.plist.backend_state.facetime`), so repeat calls return the same link.
   See [crates/imessage-server-rustpush/README.md](crates/imessage-server-rustpush/README.md).
+- **Group chats map to XEP-0045 rooms in component mode** (create, rename, add/remove,
+  leave, invites, history); unit-tested against a fake component and real slixmpp
+  parsing, never run against real Apple or a real XMPP client. See
+  [bridge/README.md](bridge/README.md#group-chats-as-rooms-component-mode).
 - **Group replies are implemented.** `/im/send` accepts an optional `chat_guid`;
   participants and group id are learned from inbound messages and persisted. Not yet
   live-verified, because no inbound group message has ever arrived.

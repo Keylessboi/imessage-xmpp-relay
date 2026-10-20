@@ -7,12 +7,14 @@ from __future__ import annotations
 
 import copy
 from collections import Counter, OrderedDict
+from dataclasses import replace
 from typing import Optional
 
 from .component import jid_to_handle, peer_jid
 from .config import Config
 from .dedup import DedupCache
 from .logsetup import get_logger
+from .muc import maybe_make_group_service
 from .models import (
     IMessageEvent,
     IncomingXmpp,
@@ -151,6 +153,8 @@ class Bridge:
         self._deny_logged = False
         self.rich = RichFeatures(cfg, transport, upstream, self._notify, self.stats)
         transport.set_incoming_handler(self.on_xmpp_message)
+        # Component mode only: iMessage groups as XEP-0045 rooms (relay/muc.py).
+        self.groups = maybe_make_group_service(cfg, transport, upstream)
 
     # -- iMessage -> XMPP --------------------------------------------------
 
@@ -158,6 +162,12 @@ class Bridge:
         etype = event.get("type")
         if etype == "ready":
             log.info("imessage-server reported ready", event="upstream_ready")
+            if self.groups is not None:
+                await self.groups.hydrate()
+            return
+        if etype == "group":
+            if self.groups is not None:
+                await self.groups.on_group_event(event)
             return
         if etype in RICH_EVENTS:
             await self.rich.on_event(str(etype), event)
@@ -178,6 +188,18 @@ class Bridge:
             return
 
         message, extras = self.rich.decorate(message)
+        if self.groups is not None and message.is_group:
+            # Rooms get placeholders and the "> quoted" reply fallback as plain text;
+            # per-message ids/receipts are not used there (the room stanza id is the guid,
+            # so XEP-0461 replies from the owner still resolve).
+            self.rich.remember_inbound(message)
+            room_msg = message
+            if extras is not None and extras.quote_prefix:
+                room_msg = replace(message, text=extras.quote_prefix + message.text)
+            if await self.groups.on_message(room_msg):
+                self.stats["delivered"] += 1
+                return
+
         outgoing = plan_delivery(self.cfg, message)
         if not outgoing:
             self.stats["unrouted"] += 1

@@ -13,6 +13,7 @@
 //! POST /im/register-phone <- {"number":str,"signature":<hex>} -> {"ok":true}
 //! POST /im/facetime-link  <- {"handle":str|null} -> {"ok":true,"url":str}
 //! GET  /apns-token        -> {"token":"<hex>"} | 503 {"error":str}
+//! (group endpoints: additive, see groups.rs)
 //!
 //!
 //! Do not change these shapes; another service is written against them.
@@ -391,6 +392,7 @@ pub fn router(app: Arc<AppState>) -> Router {
         .route("/im/register-phone", post(register_phone))
         .route("/im/facetime-link", post(im_facetime_link))
         .route("/apns-token", get(apns_token))
+        .merge(crate::groups::routes())
         .with_state(app)
 }
 

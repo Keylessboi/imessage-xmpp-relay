@@ -45,7 +45,8 @@ use rustpush::{
     authenticate_apple, authenticate_phone, login_apple_delegates, register, APSConnection,
     APSConnectionResource, APSState, AppleAccount, ArcAnisetteClient, AuthPhone, ConversationData,
     DefaultAnisetteProvider, IDSNGMIdentity, IDSUser, IMClient, LoginClientInfo, LoginDelegate,
-    Message, MessageInst, MessageType, NormalMessage, OSConfig, RelayConfig, MADRID_SERVICE,
+    ChangeParticipantMessage, Message, MessageInst, MessageType, NormalMessage, OSConfig,
+    RelayConfig, RenameMessage, MADRID_SERVICE,
 };
 
 use imessage_server::backend::{Action, Backend, BackendError, LoginStatus};
@@ -53,6 +54,7 @@ use imessage_server::config::Config;
 use imessage_server::events::{
     chat_guid_for, normalize_handle, strip_handle, EventBus, MessageEvent,
 };
+use imessage_server::groups::{GroupInfo, GroupOp, GroupResult};
 use imessage_server::hexutil;
 use imessage_server::state::StateStore;
 
@@ -318,19 +320,26 @@ struct SavedBackend {
 
 /// One conversation learned from an inbound message.
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
-struct SavedChat {
+pub(crate) struct SavedChat {
     /// Full participant set from the inbound message, `tel:`/`mailto:`
     /// prefixed so it can go straight back out as IDS participants.
     #[serde(default)]
-    participants: Vec<String>,
+    pub(crate) participants: Vec<String>,
     /// iMessage group id (the wire `gid`): the id every member's device keys
     /// the thread on. Reusing it is what makes a reply land in the existing
     /// thread rather than starting a new one.
     #[serde(default)]
-    sender_guid: Option<String>,
+    pub(crate) sender_guid: Option<String>,
     /// Unix ms of the last inbound message, used only for eviction.
     #[serde(default)]
-    updated_ms: i64,
+    pub(crate) updated_ms: i64,
+    /// Group name (`cv_name`), learned from inbound messages / renames or set
+    /// by us. `None` for an unnamed group.
+    #[serde(default)]
+    pub(crate) name: Option<String>,
+    /// Highest member-change version seen or sent (`group_version`).
+    #[serde(default)]
+    pub(crate) group_version: u64,
 }
 
 /// Shared, cheap-to-clone conversation map.
@@ -784,6 +793,14 @@ impl Backend for RustpushBackend {
         self.send_action_inner(to, chat_guid, &action)
             .await
             .map_err(|e| BackendError::unavailable(format!("{e:#}")))
+    }
+
+    async fn list_groups(&self) -> Result<Vec<GroupInfo>, BackendError> {
+        self.list_groups_inner()
+    }
+
+    async fn group_op(&self, op: GroupOp) -> Result<GroupResult, BackendError> {
+        self.group_op_inner(op).await
     }
 
     async fn facetime_link(&self, handle: Option<&str>) -> Result<String, BackendError> {
@@ -1672,7 +1689,7 @@ fn persist_backend(
 fn group_conversation(chat: &SavedChat, sender_guid: String) -> ConversationData {
     ConversationData {
         participants: chat.participants.clone(),
-        cv_name: None,
+        cv_name: chat.name.clone(),
         sender_guid: Some(sender_guid),
         after_guid: None,
     }
@@ -1710,10 +1727,17 @@ fn remember_chat(chats: &Chats, store: &StateStore, inst: &MessageInst) {
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as i64)
         .unwrap_or(0);
-    let chat = SavedChat {
+    let mut chat = SavedChat {
         participants,
         sender_guid: Some(sender_guid.clone()),
         updated_ms,
+        // Only an ordinary message carries the *current* name; a rename's
+        // conversation holds the old one.
+        name: match &inst.message {
+            Message::Message(_) => conversation.cv_name.clone().filter(|n| !n.is_empty()),
+            _ => None,
+        },
+        group_version: 0,
     };
 
     let snapshot = {
@@ -1722,9 +1746,15 @@ fn remember_chat(chats: &Chats, store: &StateStore, inst: &MessageInst) {
         };
         // Only rewrite state.plist when the conversation is new or its member
         // list changed (a group add/remove); ordinary messages are no-ops.
+        if let Some(existing) = map.get(&sender_guid) {
+            chat.name = chat.name.or_else(|| existing.name.clone());
+            chat.group_version = existing.group_version;
+        }
         let changed = map
             .get(&sender_guid)
-            .map(|existing| existing.participants != chat.participants)
+            .map(|existing| {
+                existing.participants != chat.participants || existing.name != chat.name
+            })
             .unwrap_or(true);
         map.insert(sender_guid.clone(), chat);
         if map.len() > MAX_CHATS {
@@ -1747,6 +1777,24 @@ fn remember_chat(chats: &Chats, store: &StateStore, inst: &MessageInst) {
         persist_chats(store, &snapshot);
         tracing::debug!(chat_guid = %sender_guid, "recorded conversation for group replies");
     }
+}
+
+/// Apply an inbound rename / member / icon change to the saved chats and
+/// publish it as a `group` SSE event (additive; see `groups.rs`).
+fn publish_group_change(chats: &Chats, store: &StateStore, bus: &EventBus, inst: &MessageInst) {
+    let Ok(mut map) = chats.write() else {
+        return;
+    };
+    let Some((event, changed)) = crate::groups::apply_inbound(&mut map, inst) else {
+        return;
+    };
+    let snapshot = changed.then(|| map.clone());
+    drop(map);
+    if let Some(snapshot) = snapshot {
+        persist_chats(store, &snapshot);
+    }
+    tracing::info!(chat_guid = %event.chat_guid, kind = %event.kind, "inbound group change");
+    bus.group(event);
 }
 
 /// Recent outbound sends, consulted when an IDS error arrives for one of them.
@@ -1885,6 +1933,7 @@ async fn receive_loop(
                     // Learn the conversation before publishing it, so a
                     // reply can address this chat_guid immediately.
                     remember_chat(&chats, &store, &inst);
+                    publish_group_change(&chats, &store, &bus, &inst);
                     if let Message::Error(e) = &inst.message {
                         handle_ids_error(&client, e).await;
                     }
@@ -1906,6 +1955,190 @@ async fn receive_loop(
                 tracing::warn!("dropped {count} push messages (subscriber lagged)");
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        }
+    }
+}
+
+// -------------------------------------------------------- group chats ------
+//
+// Additive: the pure state transitions live in groups.rs. An iMessage group is
+// a member list plus a group id; creating, renaming and changing members are
+// ordinary messages carrying that id, so each op below is "send one message,
+// then update our copy". UNTESTED against real Apple: only the pure logic is
+// unit tested; a live group send is not proven (see README).
+
+/// Send one non-text message (rename / member change) and return its guid.
+async fn send_control(
+    client: &IMClient,
+    conversation: ConversationData,
+    message: Message,
+) -> Result<String> {
+    let handles = client.identity.get_handles().await;
+    let sender = handles
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow!("no IDS handle is registered"))?;
+    let mut inst = MessageInst::new(conversation, &sender, message);
+    let guid = inst.id.clone();
+    client
+        .send(&mut inst)
+        .await
+        .map_err(|e| anyhow!("send failed: {e}"))?;
+    Ok(guid)
+}
+
+impl RustpushBackend {
+    fn list_groups_inner(&self) -> Result<Vec<GroupInfo>, BackendError> {
+        let map = self
+            .chats
+            .read()
+            .map_err(|_| BackendError::internal("conversation map lock poisoned"))?;
+        let mut groups: Vec<GroupInfo> = map
+            .iter()
+            .filter(|(_, chat)| chat.participants.len() > 2)
+            .map(|(guid, chat)| chat.info(guid))
+            .collect();
+        groups.sort_by(|a, b| a.chat_guid.cmp(&b.chat_guid));
+        Ok(groups)
+    }
+
+    /// The IMClient and our own handles (prefixed), or a 503.
+    async fn group_client(&self) -> Result<(Arc<IMClient>, Vec<String>), BackendError> {
+        let guard = self.running.read().await;
+        let running = guard
+            .as_ref()
+            .ok_or_else(|| BackendError::unavailable("backend is not running yet"))?;
+        let client = running.client.clone().ok_or_else(|| {
+            BackendError::unavailable("no IDS user is registered with Apple yet")
+        })?;
+        drop(guard);
+        let me = client.identity.get_handles().await;
+        if me.is_empty() {
+            return Err(BackendError::unavailable("no IDS handle is registered"));
+        }
+        Ok((client, me))
+    }
+
+    fn known_chat(&self, chat_guid: &str) -> Result<SavedChat, BackendError> {
+        self.chats
+            .read()
+            .map_err(|_| BackendError::internal("conversation map lock poisoned"))?
+            .get(chat_guid)
+            .cloned()
+            .filter(|chat| chat.participants.len() > 2 && chat.sender_guid.is_some())
+            .ok_or_else(|| {
+                BackendError::new(
+                    StatusCode::NOT_FOUND,
+                    format!("unknown group `{chat_guid}` (no group with that id has been seen)"),
+                )
+            })
+    }
+
+    /// Insert or drop a chat and write the map back to state.plist.
+    fn put_chat(&self, chat_guid: &str, chat: Option<SavedChat>) {
+        let snapshot = {
+            let Ok(mut map) = self.chats.write() else {
+                return;
+            };
+            match chat {
+                Some(chat) => map.insert(chat_guid.to_string(), chat),
+                None => map.remove(chat_guid),
+            };
+            map.clone()
+        };
+        persist_chats(&self.store, &snapshot);
+    }
+
+    async fn group_op_inner(&self, op: GroupOp) -> Result<GroupResult, BackendError> {
+        let (client, me) = self.group_client().await?;
+        let upstream = |e: anyhow::Error| BackendError::new(StatusCode::BAD_GATEWAY, format!("{e:#}"));
+        let now_ms = || {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0)
+        };
+        match op {
+            GroupOp::Create { participants, name, text } => {
+                let mut members = participants;
+                members.push(me[0].clone());
+                let members = crate::groups::canonical(&members);
+                let chat_guid = uuid::Uuid::new_v4().to_string().to_uppercase();
+                let conversation = ConversationData {
+                    participants: members.clone(),
+                    cv_name: name.clone(),
+                    sender_guid: Some(chat_guid.clone()),
+                    after_guid: None,
+                };
+                // Creating a group is sending its first message (or, with no
+                // text, announcing its name): the others learn the member list
+                // and group id from it.
+                let guid = match (&text, &name) {
+                    (Some(text), _) => send_text(&client, conversation, text, None).await,
+                    (None, Some(name)) => {
+                        let rename = Message::RenameMessage(RenameMessage { new_name: name.clone() });
+                        send_control(&client, conversation, rename).await
+                    }
+                    (None, None) => {
+                        return Err(BackendError::bad_request("a new group needs text or a name"))
+                    }
+                }
+                .map_err(upstream)?;
+                let chat = SavedChat {
+                    participants: members,
+                    sender_guid: Some(chat_guid.clone()),
+                    updated_ms: now_ms(),
+                    name,
+                    group_version: 0,
+                };
+                let info = chat.info(&chat_guid);
+                self.put_chat(&chat_guid, Some(chat));
+                Ok(GroupResult { group: Some(info), guid: Some(guid) })
+            }
+            GroupOp::Rename { chat_guid, name } => {
+                let mut chat = self.known_chat(&chat_guid)?;
+                let gid = chat.sender_guid.clone().unwrap_or_default();
+                let conversation = group_conversation(&chat, gid);
+                let rename = Message::RenameMessage(RenameMessage { new_name: name.clone() });
+                send_control(&client, conversation, rename).await.map_err(upstream)?;
+                chat.name = Some(name);
+                let info = chat.info(&chat_guid);
+                self.put_chat(&chat_guid, Some(chat));
+                Ok(GroupResult { group: Some(info), guid: None })
+            }
+            GroupOp::Members { chat_guid, add, remove } => {
+                let mut chat = self.known_chat(&chat_guid)?;
+                let gid = chat.sender_guid.clone().unwrap_or_default();
+                let mut current = chat.participants.clone();
+                current.extend(me.iter().cloned());
+                let members = crate::groups::members_after(&current, &me, &add, &remove)
+                    .map_err(BackendError::bad_request)?;
+                let version = chat.group_version + 1;
+                let conversation = group_conversation(&chat, gid);
+                let change = Message::ChangeParticipants(ChangeParticipantMessage {
+                    new_participants: members.clone(),
+                    group_version: version,
+                });
+                send_control(&client, conversation, change).await.map_err(upstream)?;
+                chat.participants = members;
+                chat.group_version = version;
+                let info = chat.info(&chat_guid);
+                self.put_chat(&chat_guid, Some(chat));
+                Ok(GroupResult { group: Some(info), guid: None })
+            }
+            GroupOp::Leave { chat_guid } => {
+                let chat = self.known_chat(&chat_guid)?;
+                let gid = chat.sender_guid.clone().unwrap_or_default();
+                let remaining = crate::groups::leave_members(&chat.participants, &me);
+                let conversation = group_conversation(&chat, gid);
+                let change = Message::ChangeParticipants(ChangeParticipantMessage {
+                    new_participants: remaining,
+                    group_version: chat.group_version + 1,
+                });
+                send_control(&client, conversation, change).await.map_err(upstream)?;
+                self.put_chat(&chat_guid, None);
+                Ok(GroupResult::default())
+            }
         }
     }
 }
@@ -2045,7 +2278,7 @@ mod tests {
         let chat = SavedChat {
             participants: vec!["tel:+1".into(), "tel:+2".into(), "mailto:a@b".into()],
             sender_guid: Some("GID".into()),
-            updated_ms: 0,
+            ..Default::default()
         };
         let conversation = group_conversation(&chat, "GID".into());
         assert_eq!(conversation.participants, chat.participants);

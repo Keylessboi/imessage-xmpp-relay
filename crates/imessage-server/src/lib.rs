@@ -26,6 +26,7 @@ pub mod api;
 pub mod backend;
 pub mod config;
 pub mod events;
+pub mod groups;
 pub mod hexutil;
 pub mod state;
 
