@@ -33,6 +33,8 @@ class MockUpstream:
             "apple_id": "me@example.org",
         }
         self._connections = 0
+        self.facetime_calls: list[dict] = []
+        self.call_status = 200
 
     @property
     def stream_connections(self) -> int:
@@ -51,6 +53,8 @@ class MockUpstream:
         app.router.add_get("/im/events", self._events)
         for kind in ("read", "typing", "react", "edit", "unsend"):
             app.router.add_post("/im/" + kind, self._make_action(kind))
+        app.router.add_post("/im/facetime-link", self._facetime_link)
+        app.router.add_post("/im/facetime-call", self._facetime_call)
         return app
 
     def _make_action(self, kind: str):
@@ -79,6 +83,23 @@ class MockUpstream:
         if self.send_status != 200:
             return web.json_response({"error": self.send_error}, status=self.send_status)
         return web.json_response({"ok": True, "guid": "sent-guid-" + str(len(self.sent))})
+
+    FACETIME_URL = "https://facetime.apple.com/join#v=1&p=SECRET&k=KEY"
+
+    async def _facetime_link(self, request: web.Request) -> web.Response:
+        self.requests["/im/facetime-link"] += 1
+        return web.json_response({"ok": True, "url": self.FACETIME_URL})
+
+    async def _facetime_call(self, request: web.Request) -> web.Response:
+        self.requests["/im/facetime-call"] += 1
+        if self.call_status != 200:
+            if self.call_status == 404:
+                return web.Response(status=404, text="not found")
+            return web.json_response({"error": "not registered"}, status=self.call_status)
+        self.facetime_calls.append(await request.json())
+        return web.json_response(
+            {"ok": True, "url": self.FACETIME_URL, "rang": True, "note": None}
+        )
 
     async def _events(self, request: web.Request) -> web.StreamResponse:
         self.requests["/im/events"] += 1

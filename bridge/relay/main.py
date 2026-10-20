@@ -8,6 +8,7 @@ from typing import Optional
 
 from .component import ComponentTransport
 from .config import Config, ConfigError
+from .calls import CallService
 from .core import Bridge
 from .logsetup import get_logger, setup_logging
 from .upstream import Backoff, UpstreamClient, UpstreamError
@@ -78,6 +79,10 @@ async def run_service(
     )
     transport = transport or make_transport(cfg)
     bridge = Bridge(cfg, transport, upstream)
+    if isinstance(transport, ComponentTransport):
+        transport.attach_calls(
+            CallService(cfg, upstream, transport.send_message, transport.send_raw)
+        )
     stop = stop or asyncio.Event()
     install_signal_handlers(stop)
 

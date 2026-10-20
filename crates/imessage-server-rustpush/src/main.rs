@@ -8,6 +8,7 @@
 mod backend;
 mod msgfeatures;
 mod groups;
+mod facetime_call;
 mod sentlog;
 mod sms2fa;
 
