@@ -18,11 +18,20 @@ login and no phone attached.
 As of 2026-10-19:
 
 - **+15551234567 is registered on Apple IDS** as a `P:` user, with no Apple ID login.
-- An iMessage sent **from** +15551234567 to +15557654321 was **delivered** (Apple's own
-  receipt); `POST /im/send` is live.
+- **Outbound** — an iMessage sent from +15551234567 to +15557654321 was **delivered**
+  (Apple's own receipt); `POST /im/send` is live.
+- **Inbound** — a reply from that peer reached the relay, was decrypted, and was pushed to
+  the XMPP side (`delivered iMessage to XMPP`). A message typed in the XMPP client then
+  went back out as a correctly **threaded** iMessage (`reply_to` set to the inbound GUID).
+  Replayed deliveries were deduplicated rather than shown twice.
 - FaceTime join links are minted from the same phone-number-only identity.
-- **Inbound iMessage -> XMPP has not been observed yet** — no text has arrived at the
-  number. Everything below distinguishes what is proven from what is not.
+- The phone is needed for **registration only**: with it powered off, the server boots from
+  saved IDS state and stays registered.
+
+Still **unproven**, and flagged as such throughout this README: a live **group** send
+(group chat works in tests but needs an inbound group thread to exercise on the wire),
+OMEMO 2 against a real client, and the audio-call bridge. The iOS-side pieces that would
+make those work are described below.
 
 ## Components
 
