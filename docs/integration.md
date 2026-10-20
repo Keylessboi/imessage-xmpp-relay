@@ -1,6 +1,6 @@
 # Integration notes (branch integration/0.2)
 
-Three feature sets are merged: message features (receipts, typing, reactions,
+Four feature sets are merged: FaceTime calls (below), message features (receipts, typing, reactions,
 replies, edits, unsend), group chats as XEP-0045 rooms, and OMEMO in component
 mode. Everything is additive; the SSE `message` event and the HTTP API shape are
 unchanged. Nothing here has been run against real Apple or a real XMPP server or
@@ -20,6 +20,8 @@ client; see the READMEs for the exact untested list.
 | `XMPP_OMEMO_POLICY` | `required` | `required` or `opportunistic` (component mode only) |
 
 Server side (`imessage-server-rustpush`) has no new variables for these features.
+FaceTime calls have no variables either: they are on whenever `XMPP_MODE=component`
+(owner only, 2 requests per minute, nothing to configure).
 The base variables (`COMPONENT_*`, `XMPP_*`, `IMESSAGE_*`, `DEDUP_SIZE`,
 `LOG_LEVEL`) are unchanged; see the bridge README.
 
@@ -43,3 +45,14 @@ The base variables (`COMPONENT_*`, `XMPP_*`, `IMESSAGE_*`, `DEDUP_SIZE`,
   stanza id, and the `> quoted` fallback is prepended to the room text, so an
   owner reply to it resolves to the right guid. Inbound group messages are
   indexed for that purpose.
+* **FaceTime calls and OMEMO.** An XMPP call the owner starts to a contact (XEP-0353
+  `<propose/>`) is declined with a Jingle `<reject/>` (body-less, so it is sent
+  unencrypted, like other body-less stanzas) and the bridge asks the server for a
+  FaceTime call (`POST /im/facetime-call`, falling back to `/im/facetime-link`). The
+  `FaceTime: <url>` message goes through the normal `send_message` path, so it is
+  OMEMO-encrypted when `XMPP_OMEMO=1`. The link is posted to the owner only and is
+  never sent over iMessage or logged. The typed `facetime` command is matched on the
+  plaintext body before OMEMO decryption, so under OMEMO use the call button, not the
+  typed command (an encrypted `facetime` message is relayed as ordinary text).
+  Untested against real Apple and real XMPP clients; see `bridge/README.md` (Calls)
+  and the rustpush server README (FaceTime calls).
