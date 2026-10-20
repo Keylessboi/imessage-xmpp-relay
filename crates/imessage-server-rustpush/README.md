@@ -31,6 +31,17 @@ registration. The device identity is an iPhone-class `RelayConfig` built from
 [`README.md`](../../README.md) for the registration path and why a synthetic Mac
 profile fails at `id-register` with `6004`.
 
+The first time the relay answers `get-version-info`, the backend writes the
+result (the relay's version tuple plus the device UDID) to
+`<data_dir>/relay-identity.json`, atomically and with mode 0600. On later boots,
+if `REGISTRATION_RELAY_URL`/`CODE` are unset or the relay does not answer, that
+file is used instead and the log says `device identity: cached (registration
+relay unavailable)`, so the relay and the phone are a one-time dependency. The
+file is not a secret credential (it holds no relay code or Apple tokens) but it
+lives in the data dir, so keep it with the rest of the state. Deleting it only
+means the relay is needed again at the next boot; with neither relay nor cache
+the backend falls back to the Mac identity from `hwconfig.plist`.
+
 The sections below are the 2026-10-13/14 evidence trail. Where they say the
 Apple ID login is blocked, read that as **history**: `-80045` was a client-info /
 OS mismatch and the SMS 2FA submission was a header-set mismatch, both fixed.
