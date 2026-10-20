@@ -43,6 +43,7 @@ from .omemo2 import (
     LEGACY_NAMESPACE,
     NAMESPACE,
     JsonFileStorage,
+    NoOmemoDevices,
     Omemo2,
     Omemo2Error,
     PrefixedStorage,
@@ -317,18 +318,56 @@ class ComponentOmemo:
             raise PepError("item-not-found", "cancel", "no bundle")
         return items_result(node, "current", payload)
 
+    # plaintext policy ------------------------------------------------------------
+    #
+    # `required`      every 1:1 message is encrypted or not delivered.
+    # `opportunistic` encrypt whenever the owner advertises an OMEMO device; send
+    #                 and accept plaintext only while the owner advertises none
+    #                 AND the conversation has never been encrypted.  Once one
+    #                 message in a conversation (peer JID <-> owner) was
+    #                 encrypted in either direction, it is "sticky": plaintext is
+    #                 refused for good, so a stripped device list or a missing
+    #                 header cannot downgrade it.  The flag lives in the store.
+
+    @property
+    def opportunistic(self) -> bool:
+        return self.cfg.omemo_policy == "opportunistic"
+
+    def _sticky_key(self, peer_jid: str) -> str:
+        return "relay/encrypted-conversation/" + bare_jid(peer_jid)
+
+    async def is_sticky(self, peer_jid: str) -> bool:
+        assert self._storage is not None
+        return bool((await self._storage.load(self._sticky_key(peer_jid))).maybe(False))
+
+    async def _mark_sticky(self, peer_jid: str) -> None:
+        assert self._storage is not None
+        if not await self.is_sticky(peer_jid):
+            await self._storage.store(self._sticky_key(peer_jid), True)
+
+    async def plaintext_allowed(self, peer_jid: str) -> bool:
+        """May a message of this conversation travel unencrypted right now?"""
+        return self.opportunistic and not await self.is_sticky(peer_jid)
+
     # encrypt / decrypt ---------------------------------------------------------
 
     async def encrypt(self, body: str, *, peer_jid: str, to_jid: str) -> list:
         """The <encrypted/> elements (one per backend used) for body; Omemo2Error if impossible."""
+        """Raises NoOmemoDevices when the recipient has none (callers may then apply the policy)."""
         peer = await self._peer(peer_jid)
         async with peer.lock:
-            return await peer.omemo.encrypt_multi(body, to_jid=to_jid)
+            elements = await peer.omemo.encrypt_multi(body, to_jid=to_jid)
+        if self.opportunistic:
+            await self._mark_sticky(peer_jid)
+        return elements
 
     async def decrypt(self, element: ET.Element, *, peer_jid: str, from_jid: str) -> Optional[str]:
         peer = await self._peer(peer_jid)
         async with peer.lock:
-            return await peer.omemo.decrypt_any(element, from_jid=from_jid)
+            plaintext = await peer.omemo.decrypt_any(element, from_jid=from_jid)
+        if self.opportunistic:
+            await self._mark_sticky(peer_jid)
+        return plaintext
 
     def notice_due(self, peer_jid: str) -> bool:
         """Rate limit for the plaintext 'could not deliver encrypted' notice."""
@@ -341,6 +380,6 @@ class ComponentOmemo:
 
 
 __all__ = [
-    "ComponentOmemo", "ItemFetcher", "PepError", "NAMESPACE", "LEGACY_NAMESPACE",
+    "ComponentOmemo", "ItemFetcher", "NoOmemoDevices", "PepError", "NAMESPACE", "LEGACY_NAMESPACE",
     "disco_info_result", "disco_items_result", "items_result",
 ]

@@ -40,7 +40,7 @@ make those work are described below.
 | [crates/openbubbles-relay](crates/openbubbles-relay/src/main.rs) | HTTP relay: hardware profile -> live Apple validation data, plus `emit-hwconfig` | **Working live**, but a *synthetic* profile is not enough to register a number — see [the synthetic-identity trap](#the-synthetic-identity-trap-the-most-useful-lesson-here) |
 | [crates/imessage-server](crates/imessage-server/README.md) | Headless iMessage server; frozen HTTP/SSE API on :8790 | Builds, 19 tests, stub backend |
 | [crates/imessage-server-rustpush](crates/imessage-server-rustpush/README.md) | The real Apple IDS backend (rustpush) | **+15551234567 registered; `/im/send` and `/im/facetime-link` live**; no Apple ID login |
-| [bridge](bridge/README.md) | XMPP <-> iMessage bridge, client account or XEP-0114 component | 106 tests green; component mode **proven against ejabberd 26.9.0**; OMEMO implemented, not client-tested |
+| [bridge](bridge/README.md) | XMPP <-> iMessage bridge, client account or XEP-0114 component | 144 tests green; component mode **proven against ejabberd 26.9.0**; OMEMO (OMEMO 2 + legacy, per-peer identities, bridge-side PEP responder) implemented, not client-tested |
 | [vendor/open-absinthe](vendor/open-absinthe/) | Emulated Apple NAC binary (Unicorn) — **vendored**, see below | AGPL-3.0, in-tree |
 | [deploy/docker](deploy/docker/relay.Dockerfile) | Container image for the relay | Written, not built |
 | [deploy/docker/server.Dockerfile](deploy/docker/server.Dockerfile) | Container image for `imessage-server-rustpush` (the :8790 server). Stage the build context with [scripts/stage-build-context.sh](scripts/stage-build-context.sh), which keeps every secret out of it | Built on a homelab node, 2026-10-20 |
@@ -328,9 +328,9 @@ depends on the Apple ID login completing.
 - **XMPP component mode was proven end to end against a real ejabberd 26.9.0**:
   handshake accepted, presence `subscribed`+`available`, an XMPP message became a
   delivered iMessage, and a non-owner JID was denied. Client mode (single bot account,
-  prefixed text) also exists. OMEMO 2 is implemented in the bridge but has **not** been
-  exercised against a real client. See [bridge/README.md](bridge/README.md).
-- **The bridge suite is green**: 106 tests, including component mode and OMEMO 2.
+  prefixed text) also exists. OMEMO is implemented in the bridge (component mode answers
+  the PEP lookups itself) but has **not** been exercised against a real client. See [bridge/README.md](bridge/README.md).
+- **The bridge suite is green**: 144 tests, including component mode and OMEMO (OMEMO 2 + legacy).
   `imessage-server` has 19 tests and a stub backend.
 - **The validation-data relay still works live** against Apple from a synthetic
   profile, and `emit-hwconfig` still produces a rustpush hardware config. That is a

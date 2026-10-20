@@ -365,12 +365,26 @@ class ComponentTransport:
         return item[0]
 
     async def _send_encrypted(self, *, to: str, body: str, mtype: str, sender: str) -> None:
-        from .omemo2 import Omemo2Error
+        from .omemo2 import NoOmemoDevices, Omemo2Error
 
         try:
             if self._omemo is None:
                 raise Omemo2Error("OMEMO is enabled but not initialised")
-            elements = await self._omemo.encrypt(body, peer_jid=bare_jid(sender), to_jid=to)
+            try:
+                elements = await self._omemo.encrypt(body, peer_jid=bare_jid(sender), to_jid=to)
+            except NoOmemoDevices:
+                # Only an explicit opportunistic policy, on a conversation that was
+                # never encrypted, may fall back; everything else is fail-closed.
+                if not await self._omemo.plaintext_allowed(bare_jid(sender)):
+                    raise
+                log.info(
+                    "recipient advertises no OMEMO device; sending in plaintext (opportunistic policy)",
+                    event="omemo_plaintext_sent",
+                    to=to,
+                    frm=sender,
+                )
+                await self._send(self.xmpp.make_message(mto=to, mbody=body, mtype=mtype, mfrom=sender))
+                return
         except Exception as exc:  # noqa: BLE001 - every failure is fail-closed
             log.error(
                 "could not encrypt; the message was NOT sent (no plaintext fallback)",
@@ -382,13 +396,15 @@ class ComponentTransport:
             await self._send_failure_notice(to=to, sender=sender)
             raise Omemo2Error("message to " + to + " not delivered: OMEMO encryption failed") from exc
 
+        # One stanza carries every backend's <encrypted/> (each device has a key in
+        # exactly one of them), so a device never sees a second, keyless copy.
+        msg = self.xmpp.make_message(mto=to, mbody=OMEMO_FALLBACK_BODY, mtype=mtype, mfrom=sender)
         for element in elements:
-            namespace = element.tag[1:].split("}", 1)[0]
-            msg = self.xmpp.make_message(mto=to, mbody=OMEMO_FALLBACK_BODY, mtype=mtype, mfrom=sender)
             msg.xml.append(element)
-            ET.SubElement(msg.xml, "{" + HINTS_NS + "}store")
-            ET.SubElement(msg.xml, "{" + EME_NS + "}encryption", {"namespace": namespace, "name": "OMEMO"})
-            await self._send(msg)
+        ET.SubElement(msg.xml, "{" + HINTS_NS + "}store")
+        namespace = elements[0].tag[1:].split("}", 1)[0]
+        ET.SubElement(msg.xml, "{" + EME_NS + "}encryption", {"namespace": namespace, "name": "OMEMO"})
+        await self._send(msg)
 
     async def _send_failure_notice(self, *, to: str, sender: str) -> None:
         """Tell the owner (plaintext, no content) that a message was withheld."""
@@ -547,9 +563,11 @@ class ComponentTransport:
         xml = getattr(msg, "xml", None)  # unit-test fakes carry no XML
         encrypted = None
         if xml is not None:
-            encrypted = xml.find(OMEMO2_ENCRYPTED_TAG)
-            if encrypted is None:
-                encrypted = xml.find(LEGACY_ENCRYPTED_TAG)
+            # A stanza may carry both backends; OMEMO 2 is tried before legacy.
+            encrypted = [
+                el for el in (xml.find(OMEMO2_ENCRYPTED_TAG), xml.find(LEGACY_ENCRYPTED_TAG))
+                if el is not None
+            ] or None
         if not self.cfg.omemo:
             if encrypted is not None:
                 log.warning(
@@ -560,6 +578,13 @@ class ComponentTransport:
                 return None
             return msg["body"]
 
+        if encrypted is None and self._omemo is not None and await self._omemo.plaintext_allowed(bare_jid(to_jid)):
+            log.info(
+                "accepting a plaintext message (opportunistic policy, conversation never encrypted)",
+                event="omemo_plaintext_accepted",
+                to_jid=to_jid,
+            )
+            return msg["body"]
         if encrypted is None:
             log.warning(
                 "refusing an unencrypted message while XMPP_OMEMO is on",
@@ -575,9 +600,19 @@ class ComponentTransport:
         try:
             if self._omemo is None:
                 raise RuntimeError("OMEMO is not initialised")
-            plaintext = await self._omemo.decrypt(
-                encrypted, peer_jid=bare_jid(to_jid), from_jid=str(msg["from"])
-            )
+            plaintext = None
+            last_error: Optional[Exception] = None
+            for element in encrypted:
+                try:
+                    plaintext = await self._omemo.decrypt(
+                        element, peer_jid=bare_jid(to_jid), from_jid=str(msg["from"])
+                    )
+                    last_error = None
+                    break
+                except Exception as exc:  # noqa: BLE001 - e.g. no key for us in this element
+                    last_error = exc
+            if last_error is not None:
+                raise last_error
         except Exception as exc:  # noqa: BLE001 - any failure drops the message
             log.error(
                 "could not decrypt OMEMO message; dropping it",

@@ -74,6 +74,7 @@ logged, and the startup log line renders the effective config through
 | `XMPP_DIRECT_TLS` | off | `1` uses implicit TLS (xmpps) instead of STARTTLS |
 | `XMPP_OMEMO` | off | `1` enables OMEMO 2 (`urn:xmpp:omemo:2`) for 1:1 chats |
 | `XMPP_OMEMO_STORE` | **required** with `XMPP_OMEMO` | File holding the OMEMO identity + sessions (mode 0600, never logged) |
+| `XMPP_OMEMO_POLICY` | `required` | Component mode only: `required` (encrypted or not delivered) or `opportunistic` (see [OMEMO in component mode](#omemo-in-component-mode)) |
 | `XMPP_OMEMO_BTBV` | on | `0` disables blind trust: unknown devices are refused instead of trusted |
 | `IMESSAGE_API_URL` | `http://imessage-server:8790` | Base URL of the imessage-server |
 | `IMESSAGE_DEFAULT_TO` | — | Fallback destination handle for inbound XMPP messages |
@@ -128,8 +129,8 @@ A plain word localpart such as `alice@domain` is rejected, not guessed.
   receipts, carbons), unknown or malformed localparts, and messages from the
   component's own domain are ignored and counted/logged, never fatal. A
   message is never sent to the component itself.
-* **No OMEMO** in component mode (`XMPP_OMEMO=1` is rejected): an external
-  component has no OMEMO device identity.
+* **OMEMO** is supported in component mode through a bridge-side emulation of
+  the minimum PEP: see [OMEMO in component mode](#omemo-in-component-mode).
 * **Group chats** have no MUC in component mode: group events go to the owner
   from the sender's peer JID with `[group] Name (handle): ` in the body.
 
@@ -192,6 +193,92 @@ legacy `eu.siacs.conversations.axolotl` (OMEMO 0.3).
 * **Trust.** Blind Trust Before Verification is on by default, so a newly
   learned device is trusted automatically (like most desktop clients). With
   `XMPP_OMEMO_BTBV=0` an unknown device makes encryption fail instead.
+
+### OMEMO in component mode
+
+An XEP-0114 component has no account and no PEP, and the ejabberd vhost behind
+it is only a placeholder. OMEMO clients still look a contact up by fetching its
+device list and bundles from the contact's bare JID, so the bridge answers those
+IQs itself (`relay/component_omemo.py`). Everything below is covered by offline
+tests and **none of it has run against a real client**.
+
+**Identities.** Every peer JID (`<handle>@imessage.sandstorm.chat`) gets its own
+OMEMO identity (device id, identity key, prekeys), created lazily the first time
+the owner asks about that JID or a message to/from it needs one. Clients key
+sessions by (JID, device id); one shared device would leave the owner without a
+session for the second contact. Both OMEMO 2 (`urn:xmpp:omemo:2`) and legacy
+OMEMO (`eu.siacs.conversations.axolotl`, what Conversations speaks) are offered
+from the same identity.
+
+**How bundles and device lists are served.** The owner's client sends
+`iq type=get` to `peer@domain`: a pubsub `items` request for
+`urn:xmpp:omemo:2:devices`, `urn:xmpp:omemo:2:bundles` (item id = device id),
+`eu.siacs.conversations.axolotl.devicelist` or
+`eu.siacs.conversations.axolotl.bundles:<deviceId>`, plus `disco#info`/
+`disco#items`. The bridge answers from the identity's published items, which
+python-omemo wrote into the store when it created the identity. Rules:
+
+* only the owner is answered (everyone else: `service-unavailable`); only the
+  component domain and generated peer JIDs are answered;
+* the service is advertised as read-only PEP (`pubsub#retrieve-items`,
+  `#persistent-items`; **no `#publish`**), and only `iq type=get` is handled, so
+  no write is ever accepted;
+* an unknown node, item or device id is `item-not-found`.
+
+The reverse direction (the owner's device list and bundles) is fetched with the
+same IQs, sent *from the peer JID* to the owner's bare JID, 15 s timeout. A
+timeout or error is fail-closed; "no node" means "no OMEMO".
+
+**What must persist (`XMPP_OMEMO_STORE`).** One JSON file (mode 0600, written
+atomically via tempfile+rename, never logged) holds for every peer JID: the
+identity key, signed prekey and prekeys, the device id, every Double Ratchet
+session, the trust decisions, the published device list and bundle that are
+served, and the "this conversation was encrypted" flags. Put it in a mounted
+**directory** (a PVC `subPath` that is a directory, with the file inside it).
+If the path itself is a file bind-mount, rename cannot replace it; the bridge
+then logs `omemo_store_inplace` and rewrites in place (works, not atomic).
+A corrupt or unreadable store makes the bridge refuse to start OMEMO (it never
+silently regenerates), and the component then sends nothing in plaintext and
+refuses OMEMO IQs.
+
+**If the store is lost:** every peer JID gets a new device id and new keys on
+its next use; all ratchet sessions are gone; the sticky-encryption flags are gone.
+The owner's clients see a *new* device for the contact (old device ids stay in
+their cached list until they refresh). With BTBV on it is trusted automatically;
+with `XMPP_OMEMO_BTBV=0` the owner must trust it by hand. Messages the owner
+encrypted for the old device cannot be decrypted and are refused with an error
+reply; later messages work after the client refreshes the contact's device list.
+Nothing else (iMessage state) lives in this file.
+
+**Plaintext policy (`XMPP_OMEMO_POLICY`).**
+
+* `required` (default): 1:1 messages to the owner are encrypted or not
+  delivered (the owner gets a content-free notice, rate limited); plaintext from
+  the owner is refused with an error reply.
+* `opportunistic`: encrypt when the owner advertises any OMEMO device. Plaintext
+  is sent, and plaintext from the owner accepted, only while the owner advertises
+  *no* device **and** the conversation (peer JID) has never been encrypted. The
+  first encrypted message in either direction makes the conversation sticky
+  (persisted): from then on plaintext is refused for good, and a stripped device
+  list or a dropped `<encrypted>` cannot downgrade it. A lookup that fails
+  (timeout, error) is never treated as "no OMEMO". Flipping `required` to
+  `opportunistic` does not make already-encrypted conversations sticky.
+* Not covered either way: group messages (no MUC in component mode; they go to
+  the owner as 1:1 messages and follow the same policy).
+
+**Stanza shape.** One `<message>` per send from the peer JID, carrying one
+`<encrypted/>` per backend that has at least one owner device (OMEMO 2 preferred
+per device), a fallback `<body>`, XEP-0334 `<store/>` and XEP-0380 EME. SCE
+(XEP-0420) envelopes for OMEMO 2 carry `from`/`to`/`time` and random padding.
+
+**Not tested (be honest).** No real client (Conversations, Dino, Gajim,
+Monal), no real ejabberd, no real iMessage path with OMEMO on. The tests pair
+the bridge with a second python-omemo manager, so both ends share one library:
+wire-format divergences from other implementations, ejabberd routing of
+`iq` to a component for a PEP node, whether a client will fetch a component
+JID's device list at all, and client UX for an identity that never sends
+presence-based PEP notifications (+notify) are unverified. Legacy messages
+carry the body without an SCE envelope, so they have no signed `from`.
 
 ### Routing rules
 
@@ -262,7 +349,7 @@ implements the frozen upstream contract on a random localhost port. Proven:
   event, and SIGTERM is translated into that stop event;
 * **Component mode** (tests/test_component.py): handle->JID mapping (phone and
   Apple-ID round trips) and JID validity; `XMPP_MODE=component` parsing, the
-  required secret/owner, owner-in-own-domain rejection, OMEMO rejection and
+  required secret/owner, owner-in-own-domain rejection, OMEMO store requirement and
   that the secret never appears in `repr`, `describe()` or logs; the transport
   against a fake slixmpp component (owner accepted, non-owner denied, unknown
   localparts / bodiless / non-chat / malformed stanzas ignored, own-domain
@@ -277,8 +364,17 @@ implements the frozen upstream contract on a random localhost port. Proven:
   0600 and never contains the plaintext; the identity survives a restart; and
   every failure path (no devices, unreachable PEP, not started, foreign element,
   plaintext on the wire) fails closed instead of sending cleartext.
+* **OMEMO in component mode** (tests/test_component_omemo.py): the pubsub/disco
+  responder (both backends, errors, non-owner and non-peer refusal, read-only
+  features, real slixmpp IQ objects); per-peer identities; OMEMO 2 and
+  legacy round trips in both directions; ratchet, bundle and device id surviving
+  a restart; a lost store minting a new device; store creation/permissions,
+  corruption and unwritable paths; the mount-point rename fallback; and the
+  `required`/`opportunistic` policy including sticky encryption, restart
+  persistence, no downgrade on a failed lookup or a stripped device list, and
+  trying every `<encrypted>` element of an inbound stanza.
 
-The suite collects **106 tests**; all pass offline, with no real XMPP server and
+The suite collects **144 tests**; all pass offline, with no real XMPP server and
 no network.
 
 ### Live verification (2026-10-19)

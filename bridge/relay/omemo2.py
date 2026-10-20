@@ -22,6 +22,7 @@ Design notes
 from __future__ import annotations
 
 import contextvars
+import errno
 import json
 import os
 import random
@@ -79,6 +80,24 @@ class Omemo2Error(Exception):
     """OMEMO 2 could not encrypt or decrypt; the caller must not send plaintext."""
 
 
+class NoOmemoDevices(Omemo2Error):
+    """The recipient was reached and publishes no OMEMO device at all.
+
+    Distinct from every other Omemo2Error (lookup failed, nobody trusted, partial
+    encryption): only this one means "the peer does not do OMEMO", the single case
+    in which the opportunistic plaintext policy may send in the clear.  A failed or
+    timed-out lookup must never be mistaken for it.
+    """
+
+
+class NoOmemoDevices(Omemo2Error):
+    """The recipient advertises no OMEMO device at all (as opposed to a failed lookup).
+
+    This is the only OMEMO failure an opportunistic policy may answer with
+    plaintext; a timeout, a PEP error or an unusable bundle stays fail-closed.
+    """
+
+
 # --------------------------------------------------------------------------- storage
 
 
@@ -94,6 +113,13 @@ class JsonFileStorage(Storage):
         super().__init__()
         self.path = path
         self._data: Dict[str, Any] = {}
+        if os.path.isdir(path):
+            raise Omemo2Error(
+                "the OMEMO store path is a directory, not a file: " + path
+                + " (a Kubernetes subPath that does not exist yet is created as a directory; "
+                "mount the volume as a directory and point XMPP_OMEMO_STORE at a file inside it)"
+            )
+        self._sweep_temp_files()
         if os.path.exists(path):
             try:
                 with open(path, "r", encoding="utf-8") as handle:
@@ -107,6 +133,20 @@ class JsonFileStorage(Storage):
                 raise Omemo2Error("the OMEMO store is not a JSON object")
             self._data = loaded
             self._tighten_mode()
+
+    def _sweep_temp_files(self) -> None:
+        """Remove .omemo-*.tmp files a crash between write and rename left behind."""
+        directory = os.path.dirname(os.path.abspath(self.path)) or "."
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            return
+        for name in names:
+            if name.startswith(".omemo-") and name.endswith(".tmp"):
+                try:
+                    os.unlink(os.path.join(directory, name))
+                except OSError:
+                    pass
 
     def _tighten_mode(self) -> None:
         """The store holds private keys: never leave it readable by others."""
@@ -142,13 +182,38 @@ class JsonFileStorage(Storage):
                 handle.flush()
                 os.fsync(handle.fileno())
             os.chmod(tmp, 0o600)
-            os.replace(tmp, self.path)
+            try:
+                os.replace(tmp, self.path)
+            except OSError as exc:
+                # The store path is itself a mount point (a file subPath volume):
+                # rename cannot replace it.  Fall back to an in-place rewrite,
+                # which is not atomic but keeps the service usable.
+                if exc.errno not in (errno.EBUSY, errno.EXDEV):
+                    raise
+                _log.warning("OMEMO store cannot be replaced atomically; writing in place",
+                             event="omemo_store_inplace")
+                with open(tmp, "rb") as src, open(self.path, "r+b" if os.path.exists(self.path) else "wb") as dst:
+                    dst.seek(0)
+                    dst.truncate()
+                    dst.write(src.read())
+                    dst.flush()
+                    os.fsync(dst.fileno())
+                os.unlink(tmp)
+                os.chmod(self.path, 0o600)
         except BaseException:
             try:
                 os.unlink(tmp)
             except OSError:
                 pass
             raise
+
+
+    def _rewrite_in_place(self) -> None:
+        with open(self.path, "w", encoding="utf-8") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            json.dump(self._data, handle, separators=(",", ":"), sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
 
 
 class PrefixedStorage(Storage):
@@ -429,6 +494,7 @@ class Omemo2:
         self._injected_storage = storage  # a shared storage view; store_path is then unused
         self._storage: Optional[Storage] = None
         self._manager: Optional[PepSessionManager] = None
+        self._device_id: Optional[int] = None
         self._started = False
 
     @property
@@ -438,9 +504,7 @@ class Omemo2:
     @property
     def device_id(self) -> Optional[int]:
         """This device's OMEMO id once started (safe to log; not key material)."""
-        if self._manager is None:
-            return None
-        return getattr(self._manager, "_SessionManager__own_device_id", None)
+        return self._device_id
 
     async def start(self) -> None:
         """Load (or create) the long-term identity and publish our bundle."""
@@ -453,14 +517,17 @@ class Omemo2:
                 pep=self.pep,
                 storage=storage,
                 btbv=self.btbv,
-                initial_own_label=self.own_label,
+                # Oldmemo has no device labels; python-omemo signs one per backend.
+                initial_own_label=None if self.legacy_pep is not None else self.own_label,
                 legacy_pep=self.legacy_pep,
             )
             # Leave history-synchronisation mode: the bridge has no history to
             # replay, and in that mode consumed pre keys are never replaced.
             await manager.after_history_sync()
+            own_device, _others = await manager.get_own_device_information()
         except omemo.SessionManagerException as exc:
             raise Omemo2Error("could not initialise OMEMO 2: " + str(exc)) from exc
+        self._device_id = own_device.device_id
         self._storage = storage
         self._manager = manager
         self._started = True
@@ -469,6 +536,7 @@ class Omemo2:
         if self._manager is not None:
             await self._manager.shutdown()
         self._manager = None
+        self._device_id = None
         self._started = False
 
     async def encrypt_body(self, body: str, *, to_jid: str) -> ET.Element:
@@ -490,7 +558,7 @@ class Omemo2:
             ) from exc
 
         if not devices:
-            raise Omemo2Error(
+            raise NoOmemoDevices(
                 "refusing to send plaintext: " + recipient + " publishes no OMEMO 2 devices"
             )
 
@@ -568,7 +636,9 @@ class Omemo2:
                 "could not fetch the OMEMO device list for " + recipient + ": " + str(exc)
             ) from exc
         if not devices:
-            raise Omemo2Error("refusing to send plaintext: " + recipient + " publishes no OMEMO devices")
+            raise NoOmemoDevices(
+                "refusing to send plaintext: " + recipient + " publishes no OMEMO devices"
+            )
 
         plaintexts: Dict[str, bytes] = {
             NAMESPACE: build_sce_envelope(body, from_jid=self.own_bare_jid, to_jid=recipient)
