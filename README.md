@@ -43,6 +43,8 @@ make those work are described below.
 | [bridge](bridge/README.md) | XMPP <-> iMessage bridge, client account or XEP-0114 component | 106 tests green; component mode **proven against ejabberd 26.9.0**; OMEMO implemented, not client-tested |
 | [vendor/open-absinthe](vendor/open-absinthe/) | Emulated Apple NAC binary (Unicorn) — **vendored**, see below | AGPL-3.0, in-tree |
 | [deploy/docker](deploy/docker/relay.Dockerfile) | Container image for the relay | Written, not built |
+| [deploy/docker/server.Dockerfile](deploy/docker/server.Dockerfile) | Container image for `imessage-server-rustpush` (the :8790 server). Stage the build context with [scripts/stage-build-context.sh](scripts/stage-build-context.sh), which keeps every secret out of it | Built on a homelab node, 2026-10-20 |
+| [bridge/Dockerfile](bridge/Dockerfile) | Container image for the XMPP bridge; secrets can come from files (`COMPONENT_SECRET_FILE`, `XMPP_PASSWORD_FILE`) | Built on a homelab node, 2026-10-20 |
 | [deploy/gitops](deploy/gitops/README.md) | Example Kubernetes manifests for an ArgoCD-managed cluster | `kubectl kustomize` renders clean; **not applied** |
 | [aka-oracle](aka-oracle/) | Android helper app: EAP-AKA over the real SIM | Working (SIM AKA proven) |
 
