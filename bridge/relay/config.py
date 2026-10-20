@@ -9,6 +9,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from typing import Optional
+from urllib.parse import urlsplit
 
 from .logsetup import get_logger
 
@@ -61,6 +62,17 @@ def _flag(value: Optional[str], default: bool) -> bool:
     if value is None or not value.strip():
         return default
     return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def parse_public_base_url(raw: Optional[str]) -> str:
+    """PUBLIC_FILE_BASE_URL: an http(s) origin, no query/fragment; "" when unset."""
+    value = (raw or "").strip().rstrip("/")
+    if not value:
+        return ""
+    parsed = urlsplit(value)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc or parsed.query or parsed.fragment:
+        raise ConfigError("PUBLIC_FILE_BASE_URL must be an http(s) URL without query or fragment")
+    return value
 
 
 def split_list(raw: Optional[str]) -> list[str]:
@@ -137,6 +149,11 @@ class Config:
     omemo: bool = False                    # XMPP_OMEMO: encrypt 1:1 chat
     omemo_store: str = ""                  # XMPP_OMEMO_STORE: identity/session file (required with XMPP_OMEMO)
     omemo_btbv: bool = True                # XMPP_OMEMO_BTBV: auto-trust new devices
+
+    # Attachments (inbound): base URL of the public /dl listener the cluster
+    # exposes, e.g. https://imessage-files.sandstorm.chat. Empty = attachment
+    # events are logged and dropped (the text placeholder still goes out).
+    public_file_base_url: str = ""         # PUBLIC_FILE_BASE_URL
 
     # Behaviour
     dedup_size: int = 4096
@@ -335,6 +352,7 @@ class Config:
             backoff_jitter=float(e.get("BACKOFF_JITTER") or 0.5),
             healthy_stream_after=float(e.get("HEALTHY_STREAM_AFTER") or 30.0),
             log_level=(e.get("LOG_LEVEL") or "INFO").strip().upper(),
+            public_file_base_url=parse_public_base_url(e.get("PUBLIC_FILE_BASE_URL")),
             omemo=_bool(e.get("XMPP_OMEMO")),
             omemo_store=(e.get("XMPP_OMEMO_STORE") or "").strip(),
             omemo_btbv=(e.get("XMPP_OMEMO_BTBV") or "1").strip().lower() in ("1", "true", "yes", "on"),

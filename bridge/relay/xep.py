@@ -11,6 +11,7 @@ Standard XEPs only:
 * XEP-0308 last message correction         (urn:xmpp:message-correct:0)
 * XEP-0424 message retraction              (urn:xmpp:message-retract:1)
 * XEP-0334 message processing hints        (urn:xmpp:hints)
+* XEP-0066 out of band data                 (jabber:x:oob)
 
 Everything is xml.etree so slixmpp stanzas (whose `.xml` is an Element) can
 take the built elements via `append` and be parsed with `parse_features`.
@@ -30,6 +31,7 @@ NS_REPLY = "urn:xmpp:reply:0"
 NS_CORRECT = "urn:xmpp:message-correct:0"
 NS_RETRACT = "urn:xmpp:message-retract:1"
 NS_HINTS = "urn:xmpp:hints"
+NS_OOB = "jabber:x:oob"
 
 CHAT_STATES = ("active", "composing", "paused", "inactive", "gone")
 # Chat states that mean "typing right now".
@@ -103,6 +105,27 @@ def store_hint() -> ET.Element:
 
 def no_store_hint() -> ET.Element:
     return _hint("no-store")
+
+
+def oob(url: str, desc: Optional[str] = None) -> ET.Element:
+    """XEP-0066 <x xmlns='jabber:x:oob'><url/><desc/></x>. The message body must
+    be the same URL: clients that ignore the element still show a plain link."""
+    el = ET.Element(_q(NS_OOB, "x"))
+    ET.SubElement(el, _q(NS_OOB, "url")).text = url
+    if desc:
+        ET.SubElement(el, _q(NS_OOB, "desc")).text = desc
+    return el
+
+
+def parse_oob_url(xml: Optional[ET.Element]) -> Optional[str]:
+    """The first XEP-0066 <url/> of a <message/>, or None."""
+    if xml is None:
+        return None
+    for child in xml.findall(_q(NS_OOB, "x")):
+        url = child.find(_q(NS_OOB, "url"))
+        if url is not None and (url.text or "").strip():
+            return url.text.strip()
+    return None
 
 
 def receipt_request() -> ET.Element:

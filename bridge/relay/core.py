@@ -10,6 +10,7 @@ from collections import Counter, OrderedDict
 from typing import Optional
 
 from .component import jid_to_handle, peer_jid
+from .attachments import Attachments
 from .config import Config
 from .dedup import DedupCache
 from .logsetup import get_logger
@@ -150,6 +151,7 @@ class Bridge:
         self.stats: Counter = Counter()
         self._deny_logged = False
         self.rich = RichFeatures(cfg, transport, upstream, self._notify, self.stats)
+        self.attachments = Attachments(cfg, transport, self.stats)
         transport.set_incoming_handler(self.on_xmpp_message)
 
     # -- iMessage -> XMPP --------------------------------------------------
@@ -158,6 +160,9 @@ class Bridge:
         etype = event.get("type")
         if etype == "ready":
             log.info("imessage-server reported ready", event="upstream_ready")
+            return
+        if etype == "attachment":
+            await self.attachments.on_event(event)
             return
         if etype in RICH_EVENTS:
             await self.rich.on_event(str(etype), event)
