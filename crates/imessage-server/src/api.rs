@@ -8,6 +8,8 @@
 //!                            or {"chat_guid":str,"text":str,"reply_to":str|null}
 //!                         -> {"ok":true,"guid":str} | non-2xx {"error":str}
 //! GET  /im/events         -> text/event-stream of the JSON in events.rs
+//! POST /im/read|typing|react|edit|unsend   (additive; see `ActionBody`)
+//!                         <- {"to"|"chat_guid":str, ...} -> {"ok":true,"guid":str}
 //! POST /im/register-phone <- {"number":str,"signature":<hex>} -> {"ok":true}
 //! POST /im/facetime-link  <- {"handle":str|null} -> {"ok":true,"url":str}
 //! GET  /apns-token        -> {"token":"<hex>"} | 503 {"error":str}
@@ -30,7 +32,7 @@ use serde_json::{json, Value};
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 
-use crate::backend::{Backend, BackendError};
+use crate::backend::{Action, Backend, BackendError};
 use crate::events::{Event, EventBus};
 use crate::hexutil;
 use crate::state::StateStore;
@@ -172,6 +174,116 @@ async fn im_send(
     Ok(Json(json!({ "ok": true, "guid": guid })))
 }
 
+/// One body for the five action endpoints; each endpoint requires its own subset.
+///   /im/read   guid
+///   /im/typing typing (default true)
+///   /im/react  guid, reaction, [emoji], [enable=true], [part], [to_text]
+///   /im/edit   guid, text, [part=0]
+///   /im/unsend guid, [part=0]
+/// Every endpoint also needs `to` or `chat_guid`.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ActionBody {
+    to: String,
+    chat_guid: Option<String>,
+    guid: String,
+    part: Option<u64>,
+    typing: Option<bool>,
+    reaction: String,
+    emoji: Option<String>,
+    enable: Option<bool>,
+    to_text: String,
+    text: String,
+}
+
+const REACTIONS: [&str; 7] = [
+    "heart", "like", "dislike", "laugh", "emphasize", "question", "emoji",
+];
+
+/// Validate an action body into a backend `Action` (pure; unit-tested).
+fn build_action(kind: &str, body: ActionBody) -> Result<Action, String> {
+    let need_guid = |body: &ActionBody| {
+        if body.guid.trim().is_empty() {
+            Err("'guid' must not be empty".to_string())
+        } else {
+            Ok(body.guid.trim().to_string())
+        }
+    };
+    match kind {
+        "read" => Ok(Action::Read { guid: need_guid(&body)? }),
+        "typing" => Ok(Action::Typing { typing: body.typing.unwrap_or(true) }),
+        "react" => {
+            let guid = need_guid(&body)?;
+            let reaction = body.reaction.trim().to_lowercase();
+            if !REACTIONS.contains(&reaction.as_str()) {
+                return Err(format!("'reaction' must be one of {}", REACTIONS.join("|")));
+            }
+            let emoji = body.emoji.filter(|e| !e.trim().is_empty());
+            if reaction == "emoji" && emoji.is_none() {
+                return Err("'emoji' is required when reaction is 'emoji'".to_string());
+            }
+            Ok(Action::React {
+                guid,
+                part: body.part,
+                reaction,
+                emoji,
+                enable: body.enable.unwrap_or(true),
+                to_text: body.to_text,
+            })
+        }
+        "edit" => {
+            let guid = need_guid(&body)?;
+            if body.text.trim().is_empty() {
+                return Err("'text' must not be empty".to_string());
+            }
+            Ok(Action::Edit { guid, part: body.part.unwrap_or(0), text: body.text })
+        }
+        "unsend" => Ok(Action::Unsend { guid: need_guid(&body)?, part: body.part.unwrap_or(0) }),
+        other => Err(format!("unknown action `{other}`")),
+    }
+}
+
+async fn run_action(
+    app: Arc<AppState>,
+    kind: &str,
+    body: Result<Json<ActionBody>, JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Json(body) =
+        body.map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, format!("invalid body: {e}")))?;
+    let to = body.to.trim().to_string();
+    let chat_guid = body
+        .chat_guid
+        .as_deref()
+        .map(str::trim)
+        .filter(|g| !g.is_empty())
+        .map(str::to_string);
+    if chat_guid.is_none() && to.is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "'to' must not be empty"));
+    }
+    let action = build_action(kind, body).map_err(|m| ApiError::new(StatusCode::BAD_REQUEST, m))?;
+    if !app.store.registered() {
+        return Err(ApiError::from(BackendError::not_registered()));
+    }
+    let guid = app.backend.send_action(&to, chat_guid.as_deref(), action).await?;
+    Ok(Json(json!({ "ok": true, "guid": guid })))
+}
+
+async fn im_read(State(app): State<Arc<AppState>>, body: Result<Json<ActionBody>, JsonRejection>) -> Result<Json<Value>, ApiError> {
+    run_action(app, "read", body).await
+}
+async fn im_typing(State(app): State<Arc<AppState>>, body: Result<Json<ActionBody>, JsonRejection>) -> Result<Json<Value>, ApiError> {
+    run_action(app, "typing", body).await
+}
+async fn im_react(State(app): State<Arc<AppState>>, body: Result<Json<ActionBody>, JsonRejection>) -> Result<Json<Value>, ApiError> {
+    run_action(app, "react", body).await
+}
+async fn im_edit(State(app): State<Arc<AppState>>, body: Result<Json<ActionBody>, JsonRejection>) -> Result<Json<Value>, ApiError> {
+    run_action(app, "edit", body).await
+}
+async fn im_unsend(State(app): State<Arc<AppState>>, body: Result<Json<ActionBody>, JsonRejection>) -> Result<Json<Value>, ApiError> {
+    run_action(app, "unsend", body).await
+}
+
 #[derive(Deserialize)]
 struct FaceTimeLinkBody {
     /// Optional context only: a FaceTime link is not tied to one recipient.
@@ -271,8 +383,87 @@ pub fn router(app: Arc<AppState>) -> Router {
         .route("/im/status", get(im_status))
         .route("/im/send", post(im_send))
         .route("/im/events", get(im_events))
+        .route("/im/read", post(im_read))
+        .route("/im/typing", post(im_typing))
+        .route("/im/react", post(im_react))
+        .route("/im/edit", post(im_edit))
+        .route("/im/unsend", post(im_unsend))
         .route("/im/register-phone", post(register_phone))
         .route("/im/facetime-link", post(im_facetime_link))
         .route("/apns-token", get(apns_token))
         .with_state(app)
+}
+
+#[cfg(test)]
+mod action_tests {
+    use super::*;
+
+    fn body(f: impl FnOnce(&mut ActionBody)) -> ActionBody {
+        let mut b = ActionBody::default();
+        b.guid = "G".into();
+        f(&mut b);
+        b
+    }
+
+    #[test]
+    fn read_and_unsend_need_a_guid() {
+        assert!(build_action("read", ActionBody::default()).is_err());
+        assert_eq!(
+            build_action("read", body(|_| {})).unwrap(),
+            Action::Read { guid: "G".into() }
+        );
+        assert_eq!(
+            build_action("unsend", body(|b| b.part = Some(2))).unwrap(),
+            Action::Unsend { guid: "G".into(), part: 2 }
+        );
+    }
+
+    #[test]
+    fn typing_defaults_to_on() {
+        assert_eq!(
+            build_action("typing", ActionBody::default()).unwrap(),
+            Action::Typing { typing: true }
+        );
+        assert_eq!(
+            build_action("typing", body(|b| b.typing = Some(false))).unwrap(),
+            Action::Typing { typing: false }
+        );
+    }
+
+    #[test]
+    fn react_validates_the_reaction_name() {
+        assert!(build_action("react", body(|b| b.reaction = "wink".into())).is_err());
+        assert!(build_action("react", body(|b| b.reaction = "emoji".into())).is_err());
+        let ok = build_action("react", body(|b| b.reaction = "Heart".into())).unwrap();
+        assert_eq!(
+            ok,
+            Action::React {
+                guid: "G".into(),
+                part: None,
+                reaction: "heart".into(),
+                emoji: None,
+                enable: true,
+                to_text: String::new(),
+            }
+        );
+        let e = build_action(
+            "react",
+            body(|b| {
+                b.reaction = "emoji".into();
+                b.emoji = Some("🎉".into());
+                b.enable = Some(false);
+            }),
+        )
+        .unwrap();
+        assert!(matches!(e, Action::React { enable: false, .. }));
+    }
+
+    #[test]
+    fn edit_needs_text() {
+        assert!(build_action("edit", body(|_| {})).is_err());
+        assert_eq!(
+            build_action("edit", body(|b| b.text = "fixed".into())).unwrap(),
+            Action::Edit { guid: "G".into(), part: 0, text: "fixed".into() }
+        );
+    }
 }

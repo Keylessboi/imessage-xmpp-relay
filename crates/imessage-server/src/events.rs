@@ -17,13 +17,102 @@ pub struct MessageEvent {
     pub sender_name: Option<String>,
 }
 
+/// A delivered (`delivered`) or read (`read`) receipt. `guid` is the message the
+/// peer is receipting (one of ours); the wire carries no conversation for these,
+/// so `chat_guid` is the 1:1 form for `from`.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct ReceiptEvent {
+    pub guid: String,
+    pub chat_guid: String,
+    pub from: String,
+    pub timestamp: i64,
+}
+
+/// Typing indicator (`typing`). `typing=false` is "stopped typing".
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct TypingEvent {
+    pub chat_guid: String,
+    pub from: String,
+    pub typing: bool,
+    pub timestamp: i64,
+}
+
+/// A tapback (`reaction`). `reaction` is heart|like|dislike|laugh|emphasize|
+/// question|emoji|sticker; `emoji` is set for `emoji`. `enable=false` removes it.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct ReactionEvent {
+    /// guid of the reaction message itself
+    pub guid: String,
+    /// guid of the message being reacted to
+    pub to_guid: String,
+    pub to_part: Option<u64>,
+    pub chat_guid: String,
+    pub from: String,
+    pub reaction: String,
+    pub emoji: Option<String>,
+    pub enable: bool,
+    pub timestamp: i64,
+}
+
+/// An edit (`edit`) of an earlier message: `guid` is the edited message.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct EditEvent {
+    pub guid: String,
+    pub part: u64,
+    pub chat_guid: String,
+    pub from: String,
+    pub text: String,
+    pub timestamp: i64,
+}
+
+/// An unsend (`unsend`) of an earlier message: `guid` is the unsent message.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct UnsendEvent {
+    pub guid: String,
+    pub part: u64,
+    pub chat_guid: String,
+    pub from: String,
+    pub timestamp: i64,
+}
+
+/// One attachment (or sticker) of an inbound message. The bytes are not
+/// downloaded; this is enough for a readable placeholder.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct AttachmentInfo {
+    pub name: String,
+    pub mime: String,
+    pub sticker: bool,
+}
+
+/// Extra facts about a `message` that its frozen shape cannot carry (reply
+/// target, attachments). Published immediately BEFORE the `message` with the
+/// same `guid`; a consumer that ignores it loses nothing.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct MessageMetaEvent {
+    pub guid: String,
+    pub chat_guid: String,
+    pub from: String,
+    pub reply_to: Option<String>,
+    pub reply_part: Option<String>,
+    pub attachments: Vec<AttachmentInfo>,
+}
+
 /// Anything that can appear on `/im/events`. Serialises with an internal tag:
-/// `{"type":"ready"}` or `{"type":"message",...}`.
+/// `{"type":"ready"}` or `{"type":"message",...}`. Every variant after
+/// `Message` is additive: the `ready` and `message` shapes are frozen.
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Event {
     Ready,
     Message(MessageEvent),
+    Delivered(ReceiptEvent),
+    Read(ReceiptEvent),
+    Typing(TypingEvent),
+    Reaction(ReactionEvent),
+    Edit(EditEvent),
+    Unsend(UnsendEvent),
+    #[serde(rename = "message_meta")]
+    MessageMeta(MessageMetaEvent),
 }
 
 /// Fan-out bus feeding every connected `/im/events` listener.
@@ -116,6 +205,35 @@ mod tests {
             serde_json::to_string(&Event::Ready).unwrap(),
             r#"{"type":"ready"}"#
         );
+    }
+
+    #[test]
+    fn additive_event_tags() {
+        let receipt = ReceiptEvent {
+            guid: "G".into(),
+            chat_guid: "iMessage;-;+1".into(),
+            from: "+1".into(),
+            timestamp: 5,
+        };
+        let v = serde_json::to_value(Event::Delivered(receipt.clone())).unwrap();
+        assert_eq!(v["type"], "delivered");
+        assert_eq!(v["guid"], "G");
+        assert_eq!(serde_json::to_value(Event::Read(receipt)).unwrap()["type"], "read");
+        let meta = Event::MessageMeta(MessageMetaEvent {
+            guid: "G".into(),
+            chat_guid: "c".into(),
+            from: "+1".into(),
+            reply_to: Some("R".into()),
+            reply_part: Some("0".into()),
+            attachments: vec![AttachmentInfo {
+                name: "a.png".into(),
+                mime: "image/png".into(),
+                sticker: true,
+            }],
+        });
+        let v = serde_json::to_value(meta).unwrap();
+        assert_eq!(v["type"], "message_meta");
+        assert_eq!(v["attachments"][0]["sticker"], true);
     }
 
     #[test]

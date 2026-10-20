@@ -68,6 +68,27 @@ impl std::fmt::Display for BackendError {
 
 impl std::error::Error for BackendError {}
 
+/// A non-text outbound action on an existing message or conversation. Built
+/// from the `/im/read|typing|react|edit|unsend` bodies by `api::build_action`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Action {
+    /// Read receipt for the inbound message `guid`.
+    Read { guid: String },
+    Typing { typing: bool },
+    /// Tapback. `reaction` is heart|like|dislike|laugh|emphasize|question|emoji;
+    /// `to_text` is the reacted-to text (Apple shows it in the notification).
+    React {
+        guid: String,
+        part: Option<u64>,
+        reaction: String,
+        emoji: Option<String>,
+        enable: bool,
+        to_text: String,
+    },
+    Edit { guid: String, part: u64, text: String },
+    Unsend { guid: String, part: u64 },
+}
+
 #[async_trait]
 pub trait Backend: Send + Sync + 'static {
     /// Short name for logs ("stub", "rustpush").
@@ -100,6 +121,20 @@ pub trait Backend: Send + Sync + 'static {
     ) -> Result<String, BackendError> {
         Err(BackendError::unavailable(
             "this backend cannot send into a group chat",
+        ))
+    }
+
+    /// Send a read receipt, typing indicator, tapback, edit or unsend to a peer
+    /// (`to`) or an existing group (`chat_guid`). Returns the wire guid. Only
+    /// called when registered. Default: unavailable, so the stub stays honest.
+    async fn send_action(
+        &self,
+        _to: &str,
+        _chat_guid: Option<&str>,
+        _action: Action,
+    ) -> Result<String, BackendError> {
+        Err(BackendError::unavailable(
+            "this backend cannot send receipts, reactions, edits or unsends",
         ))
     }
 

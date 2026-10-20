@@ -48,7 +48,7 @@ use rustpush::{
     Message, MessageInst, MessageType, NormalMessage, OSConfig, RelayConfig, MADRID_SERVICE,
 };
 
-use imessage_server::backend::{Backend, BackendError, LoginStatus};
+use imessage_server::backend::{Action, Backend, BackendError, LoginStatus};
 use imessage_server::config::Config;
 use imessage_server::events::{
     chat_guid_for, normalize_handle, strip_handle, EventBus, MessageEvent,
@@ -715,6 +715,17 @@ impl Backend for RustpushBackend {
         reply_to: Option<String>,
     ) -> Result<String, BackendError> {
         self.send_group_inner(chat_guid, text, reply_to)
+            .await
+            .map_err(|e| BackendError::unavailable(format!("{e:#}")))
+    }
+
+    async fn send_action(
+        &self,
+        to: &str,
+        chat_guid: Option<&str>,
+        action: Action,
+    ) -> Result<String, BackendError> {
+        self.send_action_inner(to, chat_guid, &action)
             .await
             .map_err(|e| BackendError::unavailable(format!("{e:#}")))
     }
@@ -1820,6 +1831,12 @@ async fn receive_loop(
                     remember_chat(&chats, &store, &inst);
                     if let Message::Error(e) = &inst.message {
                         handle_ids_error(&client, e).await;
+                    }
+                    // Additive events (receipts, typing, tapbacks, edits,
+                    // unsends, reply/attachment meta). message_meta goes out
+                    // before the message it describes.
+                    for extra in crate::msgfeatures::extra_events(&inst) {
+                        bus.publish(extra);
                     }
                     if let Some(event) = message_event(&inst) {
                         tracing::info!(guid = %event.guid, from = %event.from, "inbound message");
