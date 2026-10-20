@@ -12,8 +12,7 @@
 //!     -> IMClient::new(...) + push loop -> SSE
 //!
 //! DEGRADED MODE
-//! =============
-//! The Apple ID step (GSA SRP) and the phone-number step (carrier REG-RESP
+//! ======//! The Apple ID step (GSA SRP) and the phone-number step (carrier REG-RESP
 //! signature) are independent: authenticate_phone talks to IDS with only the
 //! device config and the APNs push token, never an Apple ID. So a failed or
 //! absent Apple ID login must not stop the process:
@@ -384,6 +383,8 @@ pub struct RustpushBackend {
     /// Inbound conversations, so /im/send can reply into a group. Loaded from
     /// state.plist at boot and written back by the push loop.
     chats: Chats,
+    /// Inbound attachment storage; `None` when no HMAC key is configured.
+    files: Option<Arc<crate::attachments::Files>>,
 }
 
 impl RustpushBackend {
@@ -394,10 +395,12 @@ impl RustpushBackend {
             .backend_state()
             .and_then(|blob| plist::from_bytes(blob.as_ref()).ok())
             .unwrap_or_default();
+        let files = crate::attachments::Files::from_config(&config);
         Self {
             config,
             store,
             bus,
+            files,
             running: Arc::new(tokio::sync::RwLock::new(None)),
             generation: Arc::new(AtomicU64::new(0)),
             login: Arc::new(RwLock::new(LoginStatus::default())),
@@ -504,6 +507,7 @@ impl RustpushBackend {
             gsa_user: self.config.gsa.user.clone(),
             gsa_pass: self.config.gsa.pass_sha256.clone(),
             chats: self.chats.clone(),
+            files: self.files.clone(),
         };
 
         // Run the login in its own task. rustpush's remote anisette provider
@@ -685,6 +689,63 @@ impl RustpushBackend {
         Ok(guid)
     }
 
+    /// Upload `path` to MMCS and send it as an attachment message to a 1:1 peer
+    /// or an existing group (same conversation resolution as `send_action_inner`).
+    async fn send_attachment_inner(
+        &self,
+        to: &str,
+        chat_guid: Option<&str>,
+        name: &str,
+        mime: &str,
+        path: &Path,
+    ) -> Result<String> {
+        let conversation = match chat_guid {
+            Some(chat_guid) => {
+                let chat = self
+                    .chats
+                    .read()
+                    .map_err(|_| anyhow!("conversation map lock poisoned"))?
+                    .get(chat_guid)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("unknown chat_guid `{chat_guid}`"))?;
+                let sender_guid = chat
+                    .sender_guid
+                    .clone()
+                    .ok_or_else(|| anyhow!("chat `{chat_guid}` has no iMessage group id"))?;
+                group_conversation(&chat, sender_guid)
+            }
+            None => ConversationData {
+                participants: vec![imessage_server::events::normalize_handle(to)],
+                cv_name: None,
+                sender_guid: Some(uuid::Uuid::new_v4().to_string()),
+                after_guid: None,
+            },
+        };
+
+        let guard = self.running.read().await;
+        let running = guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("backend is not running yet"))?;
+        let client = running.client.as_ref().ok_or_else(|| {
+            anyhow!("no IDS user is registered with Apple yet (Apple ID login failed or no phone number registered)")
+        })?;
+        let handles = client.identity.get_handles().await;
+        let sender = handles
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow!("no IDS handle is registered"))?;
+
+        let attachment = crate::attachments::upload(&running.connection, path, name, mime).await?;
+        let message = crate::attachments::attachment_message(attachment);
+        let mut inst = MessageInst::new(conversation, &sender, message);
+        let guid = inst.id.clone();
+        client
+            .send(&mut inst)
+            .await
+            .map_err(|e| anyhow!("send failed: {e}"))?;
+        Ok(guid)
+    }
+
     /// Mint (or reuse) a FaceTime join link from the registered IDS identity.
     ///
     /// rustpush builds the link from an IDS pseudonym (`create_pseudonym`,
@@ -832,6 +893,19 @@ impl Backend for RustpushBackend {
         self.group_op_inner(op).await
     }
 
+    async fn send_attachment(
+        &self,
+        to: &str,
+        chat_guid: Option<&str>,
+        name: &str,
+        mime: &str,
+        path: &Path,
+    ) -> Result<String, BackendError> {
+        self.send_attachment_inner(to, chat_guid, name, mime, path)
+            .await
+            .map_err(|e| BackendError::new(StatusCode::BAD_GATEWAY, format!("{e:#}")))
+    }
+
     async fn facetime_link(&self, handle: Option<&str>) -> Result<String, BackendError> {
         self.facetime_link_inner(handle)
             .await
@@ -919,6 +993,7 @@ impl Backend for RustpushBackend {
             identity,
             self.config.data_dir.join("id_cache.plist"),
             self.chats.clone(),
+            self.files.clone(),
         )
         .await;
         Ok(())
@@ -1009,6 +1084,7 @@ async fn install_registered(
     identity: IDSNGMIdentity,
     cache_path: PathBuf,
     chats: Chats,
+    files: Option<Arc<crate::attachments::Files>>,
 ) {
     let push_state = Some(connection.state.read().await.clone());
     let services = id_services!();
@@ -1039,6 +1115,7 @@ async fn install_registered(
     let loop_generation = generation.clone();
     let loop_chats = chats.clone();
     let loop_store = store.clone();
+    let loop_files = files.clone();
     tokio::spawn(async move {
         receive_loop(
             loop_connection,
@@ -1048,6 +1125,7 @@ async fn install_registered(
             my_generation,
             loop_chats,
             loop_store,
+            loop_files,
         )
         .await;
     });
@@ -1079,6 +1157,7 @@ struct LoginState {
     gsa_user: String,
     gsa_pass: Vec<u8>,
     chats: Chats,
+    files: Option<Arc<crate::attachments::Files>>,
 }
 
 /// Re-attempt the Apple ID login until it succeeds (or the process exits).
@@ -1206,6 +1285,7 @@ async fn complete_apple_id(state: LoginState) -> Result<()> {
         state.identity.clone(),
         state.cache_path.clone(),
         state.chats.clone(),
+        state.files.clone(),
     )
     .await;
     Ok(())
@@ -1945,6 +2025,7 @@ async fn receive_loop(
     my_generation: u64,
     chats: Chats,
     store: StateStore,
+    files: Option<Arc<crate::attachments::Files>>,
 ) {
     let mut subscription = connection.messages_cont.subscribe();
     loop {
@@ -1977,6 +2058,12 @@ async fn receive_loop(
                     // before the message it describes.
                     for extra in crate::msgfeatures::extra_events(&inst) {
                         bus.publish(extra);
+                    }
+                    // Attachments download in their own tasks; the `attachment`
+                    // event follows once the file is on disk.
+                    if let Some(files) = &files {
+                        let (from, chat_guid) = crate::msgfeatures::context(&inst);
+                        files.spawn_downloads(&connection, &bus, &inst, inst.id.clone(), chat_guid, from);
                     }
                     if let Some(event) = message_event(&inst) {
                         tracing::info!(guid = %event.guid, from = %event.from, "inbound message");

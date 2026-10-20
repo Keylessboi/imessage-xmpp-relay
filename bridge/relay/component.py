@@ -35,7 +35,7 @@ from .config import Config
 from .logsetup import get_logger
 from .models import IncomingXmpp, bare_jid, normalize_handle
 from .upstream import Backoff
-from .xep import parse_features, strip_fallback
+from .xep import parse_features, parse_oob_url, strip_fallback
 from .xmpp_side import IncomingHandler
 
 log = get_logger("relay.component")
@@ -157,6 +157,11 @@ def _is_reaction_payload(element: Any) -> bool:
     return tag == "{urn:xmpp:fallback:0}fallback" and element.get("for") == "urn:xmpp:reactions:0"
 
 
+def _is_oob_payload(element: Any) -> bool:
+    """A XEP-0066 element: it carries the (bearer) file URL, so it never rides in clear."""
+    return getattr(element, "tag", "") == "{jabber:x:oob}x"
+
+
 class ComponentTransport:
     """XmppTransport implemented with slixmpp's ComponentXMPP (XEP-0114).
 
@@ -199,6 +204,7 @@ class ComponentTransport:
         self.xmpp = xmpp
         self._calls: Optional[Any] = None  # relay.calls.CallService, see attach_calls
         self._register_handlers()
+        self._advertise_features(("jabber:x:oob",))
 
     # -- wiring ------------------------------------------------------------
 
@@ -216,6 +222,22 @@ class ComponentTransport:
             self.xmpp.register_handler(
                 CoroutineCallback("omemo-iq-get", StanzaPath("iq@type=get"), self._on_iq_get)
             )
+
+    def _advertise_features(self, features) -> None:
+        """XEP-0030: answer disco#info with the namespaces we understand.
+
+        Best effort: a fake or minimal XMPP object without the plugin is fine.
+        """
+        register = getattr(self.xmpp, "register_plugin", None)
+        if register is None:
+            return
+        try:
+            register("xep_0030")
+            disco = self.xmpp.plugin["xep_0030"]
+            for feature in features:
+                disco.add_feature(feature)
+        except Exception:  # noqa: BLE001 - never let discovery break the stream
+            log.warning("could not set up service discovery", event="component_disco_error", exc_info=True)
 
     def set_incoming_handler(self, handler: IncomingHandler) -> None:
         self._handler = handler
@@ -435,7 +457,7 @@ class ComponentTransport:
         no text to protect and go out as-is: they leak only that the owner is
         typing/reading, which XEP-0384 accepts for chat states.
         """
-        keep = [e for e in elements if not _is_reaction_payload(e)]
+        keep = [e for e in elements if not _is_reaction_payload(e) and not _is_oob_payload(e)]
         if not (body or "").strip():
             if len(keep) != len(elements):
                 log.warning("dropping a reaction with no encrypted fallback body", event="omemo_reaction_dropped", to=to)
@@ -648,7 +670,13 @@ class ComponentTransport:
             return
         features = parse_features(getattr(msg, "xml", None))
         text = strip_fallback(str(body), features) if body else ""
-        if not text.strip() and not features.interesting:
+        oob_url = parse_oob_url(getattr(msg, "xml", None))
+        if oob_url and self.cfg.omemo and oob_url.strip() not in text:
+            # The outer <x/> is unauthenticated plaintext; under OMEMO the URL must
+            # also be in the decrypted body, which is the trusted copy.
+            log.warning("ignoring a cleartext OOB URL that is not in the encrypted body", event="omemo_oob_ignored")
+            oob_url = None
+        if not text.strip() and not features.interesting and not oob_url:
             # Plain receipts (XEP-0184 <received/>), carbons: nothing to act on.
             log.debug("ignoring stanza without text", event="component_no_body", to_jid=to_jid)
             return
@@ -674,6 +702,7 @@ class ComponentTransport:
                 reply_id=features.reply_id,
                 replace_id=features.replace_id,
                 retract_id=features.retract_id,
+                oob_url=oob_url,
             )
         )
 

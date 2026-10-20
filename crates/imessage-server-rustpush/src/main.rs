@@ -5,6 +5,7 @@
 //! loop. See `backend.rs` for the protocol side and ../imessage-server/README.md
 //! for config + endpoints.
 
+mod attachments;
 mod backend;
 mod msgfeatures;
 mod groups;

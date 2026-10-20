@@ -874,3 +874,23 @@ def test_real_slixmpp_component_feeds_the_service():
         assert ("send", GUID, "yo") in api.calls
 
     run(go())
+
+
+def test_group_attachment_is_an_oob_groupchat_from_the_sender_occupant():
+    async def go():
+        svc, xmpp, _ = make()
+        await svc.on_message(event("warm up"))
+        await svc.handle_presence(stanza(join_xml()))
+        xmpp.take()
+        url = "https://files.example/dl/x?exp=1&sig=2"
+        ok = await svc.on_attachment({"chat_guid": GUID, "from": BOB, "guid": "a1"}, url, "pic.jpg")
+        assert ok is True
+        (msg,) = xmpp.take()
+        assert msg.get("type") == "groupchat" and msg.get("from") == ROOM + "/" + BOB
+        assert find(msg, "body").text == url
+        x = [c for c in msg if c.tag == "{jabber:x:oob}x"][0]
+        assert x.find("{jabber:x:oob}url").text == url
+        assert x.find("{jabber:x:oob}desc").text == "pic.jpg"
+        assert await svc.on_attachment({"chat_guid": "", "from": BOB}, url, "") is False
+
+    run(go())

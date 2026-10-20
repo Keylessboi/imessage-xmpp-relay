@@ -26,6 +26,8 @@ class MockUpstream:
         self.requests: Counter = Counter()
         self.actions: list[tuple[str, dict]] = []  # (kind, body) for /im/read|typing|react|edit|unsend
         self.action_status = 200
+        self.attachments: list[dict] = []  # POST /im/attachment: query + raw body
+        self.attachment_status = 200
         self.health_payload: dict = {"ok": True, "registered": True}
         self.status_payload: dict = {
             "registered": True,
@@ -51,6 +53,7 @@ class MockUpstream:
         app.router.add_get("/im/status", self._status)
         app.router.add_post("/im/send", self._send)
         app.router.add_get("/im/events", self._events)
+        app.router.add_post("/im/attachment", self._attachment)
         for kind in ("read", "typing", "react", "edit", "unsend"):
             app.router.add_post("/im/" + kind, self._make_action(kind))
         app.router.add_post("/im/facetime-link", self._facetime_link)
@@ -67,6 +70,14 @@ class MockUpstream:
             return web.json_response({"ok": True, "guid": payload.get("guid") or "action-guid"})
 
         return handler
+
+    async def _attachment(self, request: web.Request) -> web.Response:
+        self.requests["/im/attachment"] += 1
+        data = await request.read()
+        self.attachments.append({"query": dict(request.query), "body": data})
+        if self.attachment_status != 200:
+            return web.json_response({"error": "no upload"}, status=self.attachment_status)
+        return web.json_response({"ok": True, "guid": "att-guid", "size": len(data)})
 
     async def _health(self, request: web.Request) -> web.Response:
         self.requests["/health"] += 1

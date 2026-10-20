@@ -97,6 +97,25 @@ pub struct MessageMetaEvent {
     pub attachments: Vec<AttachmentInfo>,
 }
 
+/// A downloaded inbound attachment, ready to fetch from the file listener.
+/// Published AFTER the `message_meta` that announced it. `path` is a signed,
+/// short-lived `/dl/<id>?exp=&sig=` path to append to the public base URL.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct AttachmentEvent {
+    /// guid of the message that carried the attachment
+    pub guid: String,
+    pub chat_guid: String,
+    pub from: String,
+    /// server-minted storage id (32 hex), not the sender's
+    pub id: String,
+    /// sanitised file name
+    pub name: String,
+    /// sniffed mime type
+    pub mime: String,
+    pub size: u64,
+    pub path: String,
+}
+
 /// Anything that can appear on `/im/events`. Serialises with an internal tag:
 /// `{"type":"ready"}` or `{"type":"message",...}`. Every variant after
 /// `Message` is additive: the `ready` and `message` shapes are frozen.
@@ -115,6 +134,7 @@ pub enum Event {
     MessageMeta(MessageMetaEvent),
     /// Group rename / member change / icon change (additive; see groups.rs).
     Group(crate::groups::GroupEvent),
+    Attachment(AttachmentEvent),
 }
 
 /// Fan-out bus feeding every connected `/im/events` listener.
@@ -237,6 +257,19 @@ mod tests {
                 sticker: true,
             }],
         });
+        let att = Event::Attachment(AttachmentEvent {
+            guid: "G".into(),
+            chat_guid: "c".into(),
+            from: "+1".into(),
+            id: "a".repeat(32),
+            name: "a.png".into(),
+            mime: "image/png".into(),
+            size: 3,
+            path: "/dl/x".into(),
+        });
+        let a = serde_json::to_value(att).unwrap();
+        assert_eq!(a["type"], "attachment");
+        assert_eq!(a["size"], 3);
         let v = serde_json::to_value(meta).unwrap();
         assert_eq!(v["type"], "message_meta");
         assert_eq!(v["attachments"][0]["sticker"], true);

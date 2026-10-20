@@ -754,3 +754,24 @@ def test_fetch_item_payload_parses_a_pubsub_reply(tmp_path):
         assert "max_items" in seen["sent"] and DEVICE_LIST_NODE in seen["sent"]
 
     run(scenario())
+
+
+def test_inbound_attachment_url_never_rides_in_clear_under_omemo(tmp_path):
+    from relay import xep
+
+    async def scenario():
+        transport, co, owner, world, cap = await make_transport(tmp_path)
+        try:
+            url = "https://files.example/dl/abc?exp=1&sig=2"
+            await transport.send_message(
+                to=OWNER + "/phone", body=url, frm=PEER_A,
+                elements=[xep.oob(url, "pic.jpg"), xep.store_hint()],
+            )
+            (msg,) = cap.sent
+            xml = ET.tostring(msg.xml, encoding="unicode")
+            assert "files.example" not in xml and "jabber:x:oob" not in xml
+            assert await owner.decrypt_any(msg.xml.find(OMEMO2_TAG), from_jid=PEER_A) == url
+        finally:
+            await close_all(co, owner)
+
+    run(scenario())

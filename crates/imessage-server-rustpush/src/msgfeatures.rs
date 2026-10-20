@@ -16,7 +16,7 @@ use rustpush::{
 };
 
 /// (sender handle, chat_guid) exactly as `message_event` derives them.
-fn context(inst: &MessageInst) -> (String, String) {
+pub fn context(inst: &MessageInst) -> (String, String) {
     let from = inst.sender.as_deref().map(strip_handle).unwrap_or_default();
     let to: Vec<String> = inst
         .conversation

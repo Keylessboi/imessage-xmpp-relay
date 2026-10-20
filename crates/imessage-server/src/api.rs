@@ -10,6 +10,8 @@
 //! GET  /im/events         -> text/event-stream of the JSON in events.rs
 //! POST /im/read|typing|react|edit|unsend   (additive; see `ActionBody`)
 //!                         <- {"to"|"chat_guid":str, ...} -> {"ok":true,"guid":str}
+//! POST /im/attachment?to=|chat_guid=&name=&mime=  (additive; raw bytes body)
+//!                         -> {"ok":true,"guid":str}
 //! POST /im/register-phone <- {"number":str,"signature":<hex>} -> {"ok":true}
 //! POST /im/facetime-link  <- {"handle":str|null} -> {"ok":true,"url":str}
 //! POST /im/facetime-call  <- {"to":str,"video":bool|null}
@@ -24,7 +26,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 
 use axum::extract::rejection::JsonRejection;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -45,6 +47,10 @@ pub struct AppState {
     pub store: StateStore,
     pub backend: Arc<dyn Backend>,
     pub bus: EventBus,
+    /// Largest body `POST /im/attachment` accepts.
+    pub max_upload_bytes: u64,
+    /// Where uploads are spooled before the backend sends them.
+    pub spool_dir: std::path::PathBuf,
 }
 
 impl AppState {
@@ -53,7 +59,16 @@ impl AppState {
             store,
             backend,
             bus,
+            max_upload_bytes: 100 << 20,
+            spool_dir: std::env::temp_dir(),
         }
+    }
+
+    /// Outbound attachment limits (see `IMESSAGE_ATTACH_MAX_BYTES`).
+    pub fn with_uploads(mut self, max_upload_bytes: u64, spool_dir: std::path::PathBuf) -> Self {
+        self.max_upload_bytes = max_upload_bytes;
+        self.spool_dir = spool_dir;
+        self
     }
 }
 
@@ -288,6 +303,93 @@ async fn im_unsend(State(app): State<Arc<AppState>>, body: Result<Json<ActionBod
 }
 
 #[derive(Deserialize)]
+struct AttachmentQuery {
+    #[serde(default)]
+    to: String,
+    #[serde(default)]
+    chat_guid: Option<String>,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    mime: String,
+}
+
+/// Removes the spooled upload when the request is done, success or not.
+struct SpoolGuard(std::path::PathBuf);
+impl Drop for SpoolGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// POST /im/attachment - the request body IS the file (application/octet-stream),
+/// streamed to a spool file under a hard size cap, then handed to the backend.
+async fn im_attachment(
+    State(app): State<Arc<AppState>>,
+    Query(q): Query<AttachmentQuery>,
+    body: axum::body::Body,
+) -> Result<Json<Value>, ApiError> {
+    use tokio::io::AsyncWriteExt;
+
+    let to = q.to.trim().to_string();
+    let chat_guid = q
+        .chat_guid
+        .as_deref()
+        .map(str::trim)
+        .filter(|g| !g.is_empty())
+        .map(str::to_string);
+    if chat_guid.is_none() && to.is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "'to' or 'chat_guid' is required"));
+    }
+    if !app.store.registered() {
+        return Err(ApiError::from(BackendError::not_registered()));
+    }
+
+    tokio::fs::create_dir_all(&app.spool_dir)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("spool dir: {e}")))?;
+    let path = app.spool_dir.join(format!("up-{}.part", crate::attach::new_id()));
+    let guard = SpoolGuard(path.clone());
+    let mut file = tokio::fs::File::create(&path)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("spool file: {e}")))?;
+    let mut stream = body.into_data_stream();
+    let mut total: u64 = 0;
+    let mut head: Vec<u8> = Vec::with_capacity(32);
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk
+            .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, format!("upload interrupted: {e}")))?;
+        total += chunk.len() as u64;
+        if total > app.max_upload_bytes {
+            return Err(ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("attachment exceeds the {} byte cap", app.max_upload_bytes),
+            ));
+        }
+        if head.len() < 32 {
+            head.extend_from_slice(&chunk[..chunk.len().min(32 - head.len())]);
+        }
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("spool write: {e}")))?;
+    }
+    file.flush().await.ok();
+    drop(file);
+    if total == 0 {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "empty attachment"));
+    }
+
+    let name = crate::attach::sanitize_name(&q.name);
+    let mime = crate::attach::sniff_mime(&head, &q.mime);
+    let guid = app
+        .backend
+        .send_attachment(&to, chat_guid.as_deref(), &name, &mime, &path)
+        .await?;
+    drop(guard);
+    Ok(Json(json!({ "ok": true, "guid": guid, "name": name, "mime": mime, "size": total })))
+}
+
+#[derive(Deserialize)]
 struct FaceTimeLinkBody {
     /// Optional context only: a FaceTime link is not tied to one recipient.
     /// If this names one of the server's own handles it is used as the link's
@@ -422,6 +524,7 @@ pub fn router(app: Arc<AppState>) -> Router {
         .route("/im/edit", post(im_edit))
         .route("/im/unsend", post(im_unsend))
         .route("/im/register-phone", post(register_phone))
+        .route("/im/attachment", post(im_attachment))
         .route("/im/facetime-link", post(im_facetime_link))
         .route("/im/facetime-call", post(im_facetime_call))
         .route("/apns-token", get(apns_token))

@@ -52,6 +52,7 @@ NS_JINGLE = "urn:xmpp:jingle:1"
 NS_RTP = "urn:xmpp:jingle:apps:rtp:1"
 NS_DISCO_INFO = "http://jabber.org/protocol/disco#info"
 NS_HINTS = "urn:xmpp:hints"
+NS_OOB = "jabber:x:oob"
 
 DISCO_FEATURES = (
     NS_DISCO_INFO,
@@ -60,6 +61,7 @@ DISCO_FEATURES = (
     NS_RTP,
     "urn:xmpp:jingle:apps:rtp:audio",
     "urn:xmpp:jingle:apps:rtp:video",
+    NS_OOB,  # attachments (XEP-0066); also registered with xep_0030 in component.py
 )
 
 COMMANDS = frozenset({"facetime", "/facetime"})

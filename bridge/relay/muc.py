@@ -54,7 +54,9 @@ from .component import jid_to_handle, localpart_to_handle, peer_jid
 from .config import Config
 from .logsetup import get_logger
 from .models import IMessageEvent, bare_jid, normalize_handle
+from .outbound import FetchError, fetch_to_tempfile, guess_name
 from .upstream import UpstreamClient, UpstreamError
+from .xep import parse_oob_url
 
 log = get_logger("relay.muc")
 
@@ -481,13 +483,37 @@ class GroupService:
             await self._invite(room)
         return True
 
+    async def on_attachment(self, event: dict, url: str, name: str) -> bool:
+        """An inbound group attachment as an OOB groupchat message from the sender's occupant.
+
+        The room is plaintext (no OMEMO in rooms), so the link is as visible as any
+        room text. History keeps the URL as the body.
+        """
+        room = self._room(str(event.get("chat_guid") or ""))
+        if room is None:
+            return False
+        sender = normalize_handle(str(event.get("from") or "")) if event.get("from") else ""
+        if sender and sender not in room.participants:
+            await self._set_members(room, sorted(set(room.participants) | {sender}))
+        guid = str(event.get("guid") or "")
+        room.history.append(HistoryItem(sender, url, self.clock(), guid))
+        if room.sessions:
+            for full in list(room.sessions):
+                await self._send(self._group_message(room, sender, url, full, guid, oob=(url, name)))
+        elif self.clock() - room.invited_at > REINVITE_SECS:
+            await self._invite(room)
+        return True
+
     def _group_message(self, room: Room, handle: str, text: str, to: str, msg_id: str = "",
-                       stamp: Optional[float] = None) -> str:
+                       stamp: Optional[float] = None, oob: Optional[tuple[str, str]] = None) -> str:
         frm = self.room_address(room) + "/" + self._nick_of(room, handle)
         out = "<message type='groupchat' from=" + _a(frm) + " to=" + _a(to)
         if msg_id:
             out += " id=" + _a(msg_id)
         out += "><body>" + escape(text) + "</body>"
+        if oob is not None:
+            out += ("<x xmlns='jabber:x:oob'><url>" + escape(oob[0]) + "</url>"
+                    + ("<desc>" + escape(oob[1]) + "</desc>" if oob[1] else "") + "</x>")
         if stamp is not None:
             out += ("<delay xmlns=" + _a(NS_DELAY) + " from=" + _a(self.room_address(room))
                     + " stamp=" + _a(format_stamp(stamp)) + "/>")
@@ -717,7 +743,44 @@ class GroupService:
         if subject is not None and body is None:
             await self._set_subject(el, room, _text(subject).strip())
         elif body is not None and _text(body).strip():
-            await self._owner_says(el, room, _text(body))
+            url = parse_oob_url(el)
+            if url:
+                await self._owner_sends_file(el, room, url, _text(body))
+            else:
+                await self._owner_says(el, room, _text(body))
+
+    async def _owner_sends_file(self, el: ET.Element, room: Room, url: str, text: str) -> None:
+        """XEP-0066 in a room: fetch the (SSRF-guarded) URL and send it to the group as a file."""
+        if room.draft:
+            await self._send(self._message_error(el, "not-acceptable", "send a text message first to create the group"))
+            return
+        try:
+            path, ctype, size = await fetch_to_tempfile(
+                url, max_bytes=self.cfg.outbound_max_bytes, timeout=self.cfg.outbound_fetch_timeout
+            )
+        except FetchError as exc:
+            await self._send(self._message_error(el, "not-acceptable", "Not sent: " + str(exc)))
+            return
+        name = guess_name(url)
+        try:
+            await self.api.upstream.send_attachment("", path, name, ctype, chat_guid=room.key)
+        except UpstreamError as exc:
+            log.error("group attachment send failed", event="muc_attachment_error", room=room.key, error=str(exc))
+            await self._send(self._message_error(el, "recipient-unavailable", "iMessage attachment failed: " + str(exc)))
+            return
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        msg_id = el.get("id") or ""
+        room.history.append(HistoryItem("", url, self.clock(), msg_id))
+        for full in list(room.sessions):
+            await self._send(self._group_message(room, "", url, full, msg_id, oob=(url, name)))
+        log.info("sent a room attachment to the iMessage group", event="muc_attachment_sent", room=room.key, size=size)
+        caption = text.strip()
+        if caption and caption != url.strip():
+            await self._owner_says(el, room, caption)
 
     def _message_error(self, el: ET.Element, condition: str, text: Optional[str] = None) -> str:
         return (
