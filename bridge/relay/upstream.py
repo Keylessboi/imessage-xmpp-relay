@@ -6,6 +6,7 @@ Talks to:
 * GET  /im/status
 * POST /im/send
 * POST /im/read|typing|react|edit|unsend   (additive)
+* POST /im/attachment                      (additive; raw file body)
 * GET  /im/events   (Server-Sent Events)
 
 The event stream reconnects with exponential backoff plus jitter. A non-2xx
@@ -154,6 +155,47 @@ class UpstreamClient:
                     return {"ok": True, "raw": body[:200]}
         except aiohttp.ClientError as exc:
             raise UpstreamError("POST /im/send failed: " + str(exc)) from exc
+
+    async def send_attachment(
+        self,
+        to: str,
+        path: str,
+        name: str,
+        mime: str,
+        *,
+        timeout: float = 300.0,
+    ) -> dict:
+        """POST /im/attachment: the file at `path` is the raw request body.
+
+        The server caps, sanitises and uploads it; the timeout is long because
+        the upload to Apple happens before the answer.
+        """
+        params = {"to": to, "name": name, "mime": mime}
+        try:
+            with open(path, "rb") as fh:
+                async with self.session.post(
+                    self.base_url + "/im/attachment",
+                    params=params,
+                    data=fh,
+                    headers={"Content-Type": "application/octet-stream"},
+                    timeout=aiohttp.ClientTimeout(total=timeout),
+                ) as resp:
+                    body = await resp.text()
+                    if resp.status // 100 != 2:
+                        detail = body[:300]
+                        try:
+                            parsed = json.loads(body)
+                            if isinstance(parsed, dict) and parsed.get("error"):
+                                detail = str(parsed["error"])
+                        except ValueError:
+                            pass
+                        raise UpstreamError("POST /im/attachment -> " + str(resp.status) + ": " + detail)
+                    try:
+                        return json.loads(body) if body else {}
+                    except ValueError:
+                        return {"ok": True, "raw": body[:200]}
+        except (aiohttp.ClientError, OSError) as exc:
+            raise UpstreamError("POST /im/attachment failed: " + str(exc)) from exc
 
     async def action(self, kind: str, **fields) -> dict:
         """POST /im/<kind> (read|typing|react|edit|unsend); additive endpoints.

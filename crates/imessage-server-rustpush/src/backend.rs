@@ -681,6 +681,63 @@ impl RustpushBackend {
         Ok(guid)
     }
 
+    /// Upload `path` to MMCS and send it as an attachment message to a 1:1 peer
+    /// or an existing group (same conversation resolution as `send_action_inner`).
+    async fn send_attachment_inner(
+        &self,
+        to: &str,
+        chat_guid: Option<&str>,
+        name: &str,
+        mime: &str,
+        path: &Path,
+    ) -> Result<String> {
+        let conversation = match chat_guid {
+            Some(chat_guid) => {
+                let chat = self
+                    .chats
+                    .read()
+                    .map_err(|_| anyhow!("conversation map lock poisoned"))?
+                    .get(chat_guid)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("unknown chat_guid `{chat_guid}`"))?;
+                let sender_guid = chat
+                    .sender_guid
+                    .clone()
+                    .ok_or_else(|| anyhow!("chat `{chat_guid}` has no iMessage group id"))?;
+                group_conversation(&chat, sender_guid)
+            }
+            None => ConversationData {
+                participants: vec![imessage_server::events::normalize_handle(to)],
+                cv_name: None,
+                sender_guid: Some(uuid::Uuid::new_v4().to_string()),
+                after_guid: None,
+            },
+        };
+
+        let guard = self.running.read().await;
+        let running = guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("backend is not running yet"))?;
+        let client = running.client.as_ref().ok_or_else(|| {
+            anyhow!("no IDS user is registered with Apple yet (Apple ID login failed or no phone number registered)")
+        })?;
+        let handles = client.identity.get_handles().await;
+        let sender = handles
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow!("no IDS handle is registered"))?;
+
+        let attachment = crate::attachments::upload(&running.connection, path, name, mime).await?;
+        let message = crate::attachments::attachment_message(attachment);
+        let mut inst = MessageInst::new(conversation, &sender, message);
+        let guid = inst.id.clone();
+        client
+            .send(&mut inst)
+            .await
+            .map_err(|e| anyhow!("send failed: {e}"))?;
+        Ok(guid)
+    }
+
     /// Mint (or reuse) a FaceTime join link from the registered IDS identity.
     ///
     /// rustpush builds the link from an IDS pseudonym (`create_pseudonym`,
@@ -789,6 +846,19 @@ impl Backend for RustpushBackend {
         self.send_action_inner(to, chat_guid, &action)
             .await
             .map_err(|e| BackendError::unavailable(format!("{e:#}")))
+    }
+
+    async fn send_attachment(
+        &self,
+        to: &str,
+        chat_guid: Option<&str>,
+        name: &str,
+        mime: &str,
+        path: &Path,
+    ) -> Result<String, BackendError> {
+        self.send_attachment_inner(to, chat_guid, name, mime, path)
+            .await
+            .map_err(|e| BackendError::new(StatusCode::BAD_GATEWAY, format!("{e:#}")))
     }
 
     async fn facetime_link(&self, handle: Option<&str>) -> Result<String, BackendError> {

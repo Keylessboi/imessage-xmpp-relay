@@ -16,7 +16,10 @@ use imessage_server::attach::{store_with, Store};
 use imessage_server::config::Config;
 use imessage_server::events::{AttachmentEvent, Event, EventBus};
 use imessage_server::files::{unix_now, Signer};
-use rustpush::{APSConnection, Attachment, AttachmentType, Message, MessageInst, MessagePart};
+use rustpush::{
+    APSConnection, Attachment, AttachmentType, IndexedMessagePart, MMCSFile, Message, MessageInst,
+    MessagePart, MessageParts, MessageType, NormalMessage,
+};
 
 pub struct Files {
     store: Store,
@@ -123,4 +126,88 @@ pub fn inbound_attachments(inst: &MessageInst) -> Vec<Attachment> {
 #[allow(dead_code)]
 pub fn is_inline(a: &Attachment) -> bool {
     matches!(a.a_type, AttachmentType::Inline(_))
+}
+
+/// A normal iMessage whose only part is `attachment` (no caption).
+pub fn attachment_message(attachment: Attachment) -> Message {
+    let mut normal = NormalMessage::new(String::new(), MessageType::IMessage);
+    normal.parts = MessageParts(vec![IndexedMessagePart {
+        part: MessagePart::Attachment(attachment),
+        idx: Some(0),
+        ext: None,
+    }]);
+    Message::Message(normal)
+}
+
+/// Encrypt and upload the file at `path` to MMCS and describe it as a rustpush
+/// `Attachment`. `name` must already be sanitised and `mime` sniffed.
+///
+/// Two passes over the file (hash/chunk, then upload), so it is opened twice;
+/// rustpush reads through blocking `Read`, hence the files rather than memory.
+///
+/// UNPROVEN against real Apple: whether MMCS accepts an upload from our
+/// synthetic identity (APS c=150 + HTTP PUT, no iCloud token) is untested.
+pub async fn upload(
+    connection: &APSConnection,
+    path: &std::path::Path,
+    name: &str,
+    mime: &str,
+) -> Result<Attachment> {
+    let first = std::fs::File::open(path)?;
+    let prepared = MMCSFile::prepare_put(first)
+        .await
+        .map_err(|e| anyhow!("preparing the MMCS upload failed: {e}"))?;
+    let second = std::fs::File::open(path)?;
+    let uti = imessage_server::attach::uti_for(mime);
+    Attachment::new_mmcs(&**connection, &prepared, second, mime, uti, name, |_done, _total| {})
+        .await
+        .map_err(|e| anyhow!("MMCS upload failed: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn att() -> Attachment {
+        Attachment {
+            a_type: AttachmentType::Inline(b"abc".to_vec()),
+            part: 0,
+            uti_type: "public.png".into(),
+            mime: "image/png".into(),
+            name: "a.png".into(),
+            iris: false,
+        }
+    }
+
+    #[test]
+    fn outbound_message_has_one_attachment_part() {
+        let Message::Message(n) = attachment_message(att()) else { panic!("not a normal message") };
+        assert_eq!(n.parts.0.len(), 1);
+        assert!(matches!(&n.parts.0[0].part, MessagePart::Attachment(a) if a.name == "a.png"));
+        assert!(n.reply_guid.is_none());
+    }
+
+    #[test]
+    fn inbound_attachments_lists_attachment_parts_only() {
+        use rustpush::ConversationData;
+        let inst = MessageInst::new(
+            ConversationData {
+                participants: vec!["tel:+1".into()],
+                cv_name: None,
+                sender_guid: None,
+                after_guid: None,
+            },
+            "tel:+1",
+            attachment_message(att()),
+        );
+        let got = inbound_attachments(&inst);
+        assert_eq!(got.len(), 1);
+        assert!(is_inline(&got[0]));
+        let text = MessageInst::new(
+            ConversationData { participants: vec![], cv_name: None, sender_guid: None, after_guid: None },
+            "tel:+1",
+            Message::Message(NormalMessage::new("hi".into(), MessageType::IMessage)),
+        );
+        assert!(inbound_attachments(&text).is_empty());
+    }
 }

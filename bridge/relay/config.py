@@ -155,6 +155,10 @@ class Config:
     # events are logged and dropped (the text placeholder still goes out).
     public_file_base_url: str = ""         # PUBLIC_FILE_BASE_URL
 
+    # Attachments (outbound, component mode): the owner posts a file URL (XEP-0066).
+    outbound_max_bytes: int = 100 * 1024 * 1024   # OUTBOUND_MAX_BYTES
+    outbound_fetch_timeout: float = 120.0         # OUTBOUND_FETCH_TIMEOUT
+
     # Behaviour
     dedup_size: int = 4096
     send_read_receipts: bool = True        # RELAY_SEND_READ_RECEIPTS: XEP-0333 displayed -> iMessage read
@@ -352,6 +356,8 @@ class Config:
             backoff_jitter=float(e.get("BACKOFF_JITTER") or 0.5),
             healthy_stream_after=float(e.get("HEALTHY_STREAM_AFTER") or 30.0),
             log_level=(e.get("LOG_LEVEL") or "INFO").strip().upper(),
+            outbound_max_bytes=int(e.get("OUTBOUND_MAX_BYTES") or 100 * 1024 * 1024),
+            outbound_fetch_timeout=float(e.get("OUTBOUND_FETCH_TIMEOUT") or 120),
             public_file_base_url=parse_public_base_url(e.get("PUBLIC_FILE_BASE_URL")),
             omemo=_bool(e.get("XMPP_OMEMO")),
             omemo_store=(e.get("XMPP_OMEMO_STORE") or "").strip(),

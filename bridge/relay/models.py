@@ -43,6 +43,7 @@ class IncomingXmpp:
     reply_id: Optional[str] = None         # XEP-0461 target id
     replace_id: Optional[str] = None       # XEP-0308 corrected message id
     retract_id: Optional[str] = None       # XEP-0424 retracted message id
+    oob_url: Optional[str] = None          # XEP-0066 <x xmlns='jabber:x:oob'><url/>
 
     @property
     def has_features(self) -> bool:
@@ -52,6 +53,7 @@ class IncomingXmpp:
             or self.reactions is not None
             or self.replace_id
             or self.retract_id
+            or self.oob_url
         )
 
     @property

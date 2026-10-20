@@ -6,6 +6,7 @@ routing layer can be exercised with a fake transport in tests.
 from __future__ import annotations
 
 import copy
+import os
 from collections import Counter, OrderedDict
 from typing import Optional
 
@@ -22,6 +23,7 @@ from .models import (
     normalize_handle,
     parse_target_prefix,
 )
+from .outbound import FetchError, fetch_to_tempfile, guess_name
 from .rich import RICH_EVENTS, RichFeatures
 from .upstream import UpstreamClient, UpstreamError
 from .xmpp_side import XmppTransport
@@ -278,6 +280,10 @@ class Bridge:
         if await self.rich.on_xmpp(message, handle):
             return
 
+        if message.oob_url:
+            await self._send_oob(message, handle, text)
+            return
+
         if not text.strip():
             return
 
@@ -309,6 +315,46 @@ class Bridge:
             reply_to=reply_to,
             guid=(result or {}).get("guid"),
         )
+
+    async def _send_oob(self, message: IncomingXmpp, handle: str, text: str) -> None:
+        """XEP-0066: fetch the URL the owner sent and deliver it as an iMessage attachment."""
+        url = message.oob_url or ""
+        try:
+            path, ctype, size = await fetch_to_tempfile(
+                url,
+                max_bytes=self.cfg.outbound_max_bytes,
+                timeout=self.cfg.outbound_fetch_timeout,
+            )
+        except FetchError as exc:
+            self.stats["oob_refused"] += 1
+            log.warning("refused an outbound attachment URL", event="oob_refused", error=str(exc))
+            await self._notify(message, "Not sent: " + str(exc))
+            return
+        name = guess_name(url)
+        try:
+            result = await self.upstream.send_attachment(handle, path, name, ctype)
+        except UpstreamError as exc:
+            self.stats["send_errors"] += 1
+            log.error("imessage-server rejected the attachment", event="upstream_attachment_error",
+                      to=handle, error=str(exc))
+            await self._notify(message, "iMessage attachment failed: " + str(exc))
+            return
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        self.stats["attachments_sent"] += 1
+        self.rich.record_outbound(message, handle, "[attachment: " + name + "]", result)
+        log.info("sent XMPP attachment to iMessage", event="attachment_sent", to=handle,
+                 size=size, guid=(result or {}).get("guid"))
+        # A caption (body that is not just the URL) goes as a normal text after the file.
+        caption = text.strip()
+        if caption and caption != url.strip():
+            try:
+                await self.upstream.send(handle, caption)
+            except UpstreamError as exc:
+                await self._notify(message, "iMessage caption failed: " + str(exc))
 
     def _is_allowed(self, message: IncomingXmpp) -> bool:
         allowed = self.cfg.allowed
