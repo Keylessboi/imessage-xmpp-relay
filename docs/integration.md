@@ -33,6 +33,8 @@ Attachments (server, `imessage-server-rustpush`; the whole feature is off withou
 | --- | --- | --- |
 | `IMESSAGE_FILE_HMAC_KEY_FILE` | unset | file with the link-signing key (>= 16 bytes, 32+ random recommended); unset = no downloads, no `/dl` listener |
 | `IMESSAGE_FILES_LISTEN` | `0.0.0.0:8791` | read-only `/dl/<id>?exp=&sig=` listener (the only thing served there) |
+| `IMESSAGE_REREG_MAX_DELAY_SECS` | `600` | Max backoff between failed IDS re-registration attempts (min 300; clamped to 300..86400). Low default so a re-registration retries within about 10 min once the phone is reachable again for validation data. A failure that reaches Apple also retries at this rate. Untested against real Apple. |
+| `REGISTRATION_RELAY_URL` / `REGISTRATION_RELAY_CODE_FILE` | unset | Owner's registration relay (real iPhone identity for re-registration; the phone must be online during each registration, every ~3 days). Without them the server falls back to the Mac profile, which Apple rejects at `id-register` (6004). |
 | `IMESSAGE_ATTACH_DIR` | `<data dir>/attachments` | where downloaded files are kept |
 | `IMESSAGE_ATTACH_MAX_BYTES` | `104857600` | per-file cap (inbound and `POST /im/attachment`) |
 | `IMESSAGE_ATTACH_QUOTA_BYTES` | `2147483648` | total store quota |
