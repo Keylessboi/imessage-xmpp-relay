@@ -3,3 +3,5 @@ slixmpp>=1.8,<2
 # OMEMO 2 (XEP-0384, urn:xmpp:omemo:2): python-omemo core + the omemo:2 backend
 OMEMO>=2.1,<3
 Twomemo[xml]>=2.1,<3
+# Legacy OMEMO (eu.siacs.conversations.axolotl): what Conversations-based clients still speak
+Oldmemo[xml]>=2.1,<3

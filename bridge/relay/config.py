@@ -225,12 +225,6 @@ class Config:
                 owner=owner_bare,
             )
 
-        if _bool(e.get("XMPP_OMEMO")):
-            raise ConfigError(
-                "XMPP_OMEMO=1 is not supported in component mode: an external "
-                "component has no OMEMO device identity; component traffic is plaintext"
-            )
-
         return (
             component_jid,
             component_domain,
@@ -400,7 +394,8 @@ class Config:
                 + " allowed=" + (",".join(sorted(self.allowed)) if self.allowed else "<empty: deny all>")
                 + " api_url=" + self.api_url
                 + " default_to=" + str(self.default_to)
-                + " omemo=off"
+                + " omemo=" + ("on" if self.omemo else "off")
+                + (" store=" + self.omemo_store if self.omemo else "")
             )
         return (
             "mode=client"

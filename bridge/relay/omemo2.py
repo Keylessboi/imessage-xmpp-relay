@@ -36,13 +36,27 @@ from omemo.session_manager import SessionManager
 from omemo.storage import Just, Maybe, Nothing, Storage
 from omemo.types import DeviceInformation, TrustLevel as CoreTrustLevel
 
+import oldmemo
+import oldmemo.etree
+import oldmemo.oldmemo
+from oldmemo.oldmemo import Oldmemo
 import twomemo
 import twomemo.etree
 from twomemo.twomemo import Twomemo
 
+from .logsetup import get_logger
+
+_log = get_logger("relay.omemo2")
+
 NAMESPACE = twomemo.twomemo.NAMESPACE           # urn:xmpp:omemo:2
 DEVICE_LIST_NODE = "urn:xmpp:omemo:2:devices"
 BUNDLE_NODE = "urn:xmpp:omemo:2:bundles"
+
+# Legacy OMEMO (XEP-0384 0.3, still what Conversations-based clients speak).
+LEGACY_NAMESPACE = oldmemo.oldmemo.NAMESPACE    # eu.siacs.conversations.axolotl
+LEGACY_DEVICE_LIST_NODE = LEGACY_NAMESPACE + ".devicelist"
+LEGACY_BUNDLE_NODE_PREFIX = LEGACY_NAMESPACE + ".bundles:"
+LEGACY_ENCRYPTED_TAG = "{" + LEGACY_NAMESPACE + "}encrypted"
 
 # XEP-0420 Stanza Content Encryption (SCE) and its OMEMO profile (XEP-0384 5.5).
 SCE_NAMESPACE = "urn:xmpp:sce:1"
@@ -92,6 +106,20 @@ class JsonFileStorage(Storage):
             if not isinstance(loaded, dict):
                 raise Omemo2Error("the OMEMO store is not a JSON object")
             self._data = loaded
+            self._tighten_mode()
+
+    def _tighten_mode(self) -> None:
+        """The store holds private keys: never leave it readable by others."""
+        try:
+            if os.stat(self.path).st_mode & 0o077:
+                os.chmod(self.path, 0o600)
+        except OSError:
+            pass
+
+    def ensure_exists(self) -> None:
+        """Create an empty store (0600) now, so an unwritable path fails at startup."""
+        if not os.path.exists(self.path):
+            self._flush()
 
     async def _load(self, key: str) -> Maybe[Any]:
         return Just(self._data[key]) if key in self._data else Nothing()
@@ -111,6 +139,8 @@ class JsonFileStorage(Storage):
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 json.dump(self._data, handle, separators=(",", ":"), sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
             os.chmod(tmp, 0o600)
             os.replace(tmp, self.path)
         except BaseException:
@@ -119,6 +149,24 @@ class JsonFileStorage(Storage):
             except OSError:
                 pass
             raise
+
+
+class PrefixedStorage(Storage):
+    """A view of another storage under a key prefix (one view per peer identity)."""
+
+    def __init__(self, base: Storage, prefix: str) -> None:
+        super().__init__(disable_cache=True)
+        self._base = base
+        self._prefix = prefix
+
+    async def _load(self, key: str) -> Maybe[Any]:
+        return await self._base._load(self._prefix + key)
+
+    async def _store(self, key: str, value: Any) -> None:
+        await self._base._store(self._prefix + key, value)
+
+    async def _delete(self, key: str) -> None:
+        await self._base._delete(self._prefix + key)
 
 
 # ----------------------------------------------------------------------- PEP store
@@ -163,7 +211,7 @@ class PepSessionManager(SessionManager):
         pending = _PENDING_CONTEXT.get()
         if pending is None:
             raise Omemo2Error("PepSessionManager must be built via PepSessionManager.create_for()")
-        self._own_bare_jid, self._pep, self._btbv = pending
+        self._own_bare_jid, self._pep, self._btbv, self._legacy_pep = pending
 
     @classmethod
     async def create_for(
@@ -174,11 +222,16 @@ class PepSessionManager(SessionManager):
         storage: Storage,
         btbv: bool = True,
         initial_own_label: Optional[str] = None,
+        legacy_pep: Optional[PepStore] = None,
     ) -> "PepSessionManager":
-        token = _PENDING_CONTEXT.set((own_bare_jid, pep, btbv))
+        """Build the manager.  With legacy_pep, the legacy backend joins Twomemo."""
+        token = _PENDING_CONTEXT.set((own_bare_jid, pep, btbv, legacy_pep))
+        backends: list = [Twomemo(storage)]
+        if legacy_pep is not None:
+            backends.append(Oldmemo(storage))
         try:
             manager = await cls.create(
-                [Twomemo(storage)],
+                backends,
                 storage,
                 own_bare_jid,
                 initial_own_label,
@@ -208,6 +261,19 @@ class PepSessionManager(SessionManager):
             return CoreTrustLevel.UNDECIDED
         raise omemo.UnknownTrustLevel("Unknown OMEMO trust level: " + str(name))
 
+    async def require_trusted(self, device: DeviceInformation) -> None:
+        """Gate for decrypted messages: python-omemo decrypts for undecided senders."""
+        level = await self._evaluate_custom_trust_level(device)
+        if level is CoreTrustLevel.TRUSTED:
+            return
+        if level is CoreTrustLevel.UNDECIDED and self._btbv:
+            await self.set_trust(device.bare_jid, device.identity_key, BLINDLY_TRUSTED_TRUST_LEVEL)
+            return
+        raise Omemo2Error(
+            "message from an untrusted OMEMO device " + str(device.device_id)
+            + " of " + device.bare_jid
+        )
+
     async def _make_trust_decision(
         self,
         undecided: frozenset,
@@ -225,30 +291,41 @@ class PepSessionManager(SessionManager):
 
     # -- PEP --------------------------------------------------------------
 
+    def _backend_io(self, namespace: str):
+        """(PEP store, XML serialiser module) for a backend namespace."""
+        if namespace == NAMESPACE:
+            return self._pep, twomemo.etree
+        if namespace == LEGACY_NAMESPACE and self._legacy_pep is not None:
+            return self._legacy_pep, oldmemo.etree
+        raise omemo.UnknownNamespace("Unsupported OMEMO namespace: " + str(namespace))
+
     async def _upload_bundle(self, bundle: omemo.Bundle) -> None:
-        element = twomemo.etree.serialize_bundle(bundle)
-        await self._pep.publish_bundle(bundle.bare_jid, bundle.device_id, element)
+        pep, codec = self._backend_io(bundle.namespace)
+        await pep.publish_bundle(bundle.bare_jid, bundle.device_id, codec.serialize_bundle(bundle))
 
     async def _download_bundle(
         self, namespace: str, bare_jid: str, device_id: int
     ) -> omemo.Bundle:
-        element = await self._pep.fetch_bundle(bare_jid, device_id)
+        pep, codec = self._backend_io(namespace)
+        element = await pep.fetch_bundle(bare_jid, device_id)
         if element is None:
             raise omemo.BundleNotFound(bare_jid, device_id)
-        return twomemo.etree.parse_bundle(element, bare_jid, device_id)
+        return codec.parse_bundle(element, bare_jid, device_id)
 
     async def _delete_bundle(self, namespace: str, device_id: int) -> None:
-        await self._pep.delete_bundle(self._own_bare_jid, device_id)
+        pep, _codec = self._backend_io(namespace)
+        await pep.delete_bundle(self._own_bare_jid, device_id)
 
     async def _upload_device_list(self, namespace: str, device_list: Any) -> None:
-        element = twomemo.etree.serialize_device_list(device_list)
-        await self._pep.publish_device_list(self._own_bare_jid, element)
+        pep, codec = self._backend_io(namespace)
+        await pep.publish_device_list(self._own_bare_jid, codec.serialize_device_list(device_list))
 
     async def _download_device_list(self, namespace: str, bare_jid: str) -> Any:
-        element = await self._pep.fetch_device_list(bare_jid)
+        pep, codec = self._backend_io(namespace)
+        element = await pep.fetch_device_list(bare_jid)
         if element is None:
             return {}
-        return twomemo.etree.parse_device_list(element)
+        return codec.parse_device_list(element)
 
     async def _send_message(self, message: omemo.Message, bare_jid: str) -> None:
         # Empty OMEMO messages (heartbeats) are optional for a bridge that never
@@ -340,13 +417,17 @@ class Omemo2:
         pep: PepStore,
         btbv: bool = True,
         own_label: Optional[str] = None,
+        legacy_pep: Optional[PepStore] = None,
+        storage: Optional[Storage] = None,
     ) -> None:
         self.own_bare_jid = own_bare_jid.lower()
         self.store_path = store_path
         self.pep = pep
+        self.legacy_pep = legacy_pep  # set: legacy OMEMO joins OMEMO 2 (component mode)
         self.btbv = btbv
         self.own_label = own_label
-        self._storage: Optional[JsonFileStorage] = None
+        self._injected_storage = storage  # a shared storage view; store_path is then unused
+        self._storage: Optional[Storage] = None
         self._manager: Optional[PepSessionManager] = None
         self._started = False
 
@@ -365,7 +446,7 @@ class Omemo2:
         """Load (or create) the long-term identity and publish our bundle."""
         if self._started:
             return
-        storage = JsonFileStorage(self.store_path)
+        storage = self._injected_storage or JsonFileStorage(self.store_path)
         try:
             manager = await PepSessionManager.create_for(
                 own_bare_jid=self.own_bare_jid,
@@ -373,7 +454,11 @@ class Omemo2:
                 storage=storage,
                 btbv=self.btbv,
                 initial_own_label=self.own_label,
+                legacy_pep=self.legacy_pep,
             )
+            # Leave history-synchronisation mode: the bridge has no history to
+            # replay, and in that mode consumed pre keys are never replaced.
+            await manager.after_history_sync()
         except omemo.SessionManagerException as exc:
             raise Omemo2Error("could not initialise OMEMO 2: " + str(exc)) from exc
         self._storage = storage
@@ -457,6 +542,106 @@ class Omemo2:
         if plaintext is None:
             return None
         return parse_sce_envelope(plaintext, expect_from=device.bare_jid)
+
+    # -- multi-backend (OMEMO 2 + legacy) ----------------------------------
+
+    @property
+    def namespaces(self) -> list:
+        """Backend namespaces in encryption priority order."""
+        return [NAMESPACE] + ([LEGACY_NAMESPACE] if self.legacy_pep is not None else [])
+
+    async def encrypt_multi(self, body: str, *, to_jid: str) -> list:
+        """Encrypt body for every device of to_jid, one stanza child per backend used.
+
+        Each trusted device gets the highest-priority backend it supports (OMEMO 2
+        before legacy).  Returns the <encrypted> elements; raises Omemo2Error --
+        never a plaintext fallback -- when no device can be encrypted for.
+        """
+        manager = self._require_manager()
+        recipient = to_jid.split("/", 1)[0].strip().lower()
+        try:
+            for namespace in self.namespaces:
+                await manager.refresh_device_list(namespace, recipient)
+            devices = await manager.get_device_information(recipient)
+        except omemo.SessionManagerException as exc:
+            raise Omemo2Error(
+                "could not fetch the OMEMO device list for " + recipient + ": " + str(exc)
+            ) from exc
+        if not devices:
+            raise Omemo2Error("refusing to send plaintext: " + recipient + " publishes no OMEMO devices")
+
+        plaintexts: Dict[str, bytes] = {
+            NAMESPACE: build_sce_envelope(body, from_jid=self.own_bare_jid, to_jid=recipient)
+        }
+        if self.legacy_pep is not None:
+            plaintexts[LEGACY_NAMESPACE] = body.encode("utf-8")
+        try:
+            messages, errors = await manager.encrypt(
+                frozenset({recipient}),
+                plaintexts,
+                backend_priority_order=self.namespaces,
+            )
+        except omemo.SessionManagerException as exc:
+            raise Omemo2Error("OMEMO encryption for " + recipient + " failed: " + str(exc)) from exc
+
+        if not messages:
+            detail = "; ".join(sorted(str(error) for error in errors)) or "no eligible device"
+            raise Omemo2Error("could not encrypt for any device of " + recipient + ": " + detail)
+        out = []
+        for message in messages:
+            if message.namespace == NAMESPACE:
+                out.append(twomemo.etree.serialize_message(message))
+            elif message.namespace == LEGACY_NAMESPACE:
+                out.append(oldmemo.etree.serialize_message(message))
+            else:  # pragma: no cover - only the two registered backends exist
+                raise Omemo2Error("unexpected OMEMO namespace " + message.namespace)
+        if errors:
+            # Some devices (typically stale ones with no bundle) were skipped;
+            # the others are encrypted for.  Never reveals content.
+            log_skipped = "; ".join(sorted(str(error) for error in errors))
+            _log.warning(
+                "OMEMO: skipped devices that could not be encrypted for",
+                event="omemo_devices_skipped",
+                recipient=recipient,
+                detail=log_skipped,
+            )
+        return out
+
+    async def decrypt_any(self, element: ET.Element, *, from_jid: str) -> Optional[str]:
+        """Decrypt an OMEMO 2 or legacy <encrypted> element; None for an empty message.
+
+        Raises Omemo2Error on any failure, including an undecided device while
+        blind trust is off and a malformed or mis-addressed envelope.
+        """
+        manager = self._require_manager()
+        sender = from_jid.split("/", 1)[0].strip().lower()
+        try:
+            if element.tag == ENCRYPTED_TAG:
+                message = twomemo.etree.parse_message(element, sender)
+            elif element.tag == LEGACY_ENCRYPTED_TAG and self.legacy_pep is not None:
+                message = await oldmemo.etree.parse_message(
+                    element, sender, self.own_bare_jid, manager
+                )
+            else:
+                raise Omemo2Error("not a supported OMEMO encrypted element: " + element.tag)
+        except Omemo2Error:
+            raise
+        except Exception as exc:  # any malformed wire data is fatal here
+            raise Omemo2Error("malformed OMEMO message from " + sender + ": " + str(exc)) from exc
+        try:
+            plaintext, device, _key_material = await manager.decrypt(message)
+        except Exception as exc:  # backend errors are all fatal here
+            raise Omemo2Error("could not decrypt OMEMO message from " + sender + ": " + str(exc)) from exc
+
+        await manager.require_trusted(device)
+        if plaintext is None:
+            return None
+        if message.namespace == NAMESPACE:
+            return parse_sce_envelope(plaintext, expect_from=sender, expect_to=self.own_bare_jid)
+        try:
+            return plaintext.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise Omemo2Error("legacy OMEMO payload is not UTF-8") from exc
 
     def _require_manager(self) -> PepSessionManager:
         if not self._started or self._manager is None:

@@ -202,10 +202,13 @@ def test_invalid_mode_is_rejected():
     assert "XMPP_MODE" in str(excinfo.value)
 
 
-def test_component_mode_rejects_omemo():
+def test_component_mode_accepts_omemo_but_requires_a_store():
+    cfg = Config.from_env(component_env(XMPP_OMEMO="1", XMPP_OMEMO_STORE="/tmp/x"))
+    assert cfg.omemo and cfg.omemo_store == "/tmp/x"
+    assert "omemo=on" in cfg.describe()
     with pytest.raises(ConfigError) as excinfo:
-        Config.from_env(component_env(XMPP_OMEMO="1", XMPP_OMEMO_STORE="/tmp/x"))
-    assert "OMEMO" in str(excinfo.value)
+        Config.from_env(component_env(XMPP_OMEMO="1"))
+    assert "XMPP_OMEMO_STORE" in str(excinfo.value)
 
 
 def test_component_secret_never_appears_in_describe_repr_or_logs(caplog):
