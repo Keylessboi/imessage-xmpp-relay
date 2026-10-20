@@ -105,8 +105,19 @@ async fn relay_config(data_dir: &Path) -> Option<Arc<dyn OSConfig>> {
         .ok()
         .map(|raw| raw.trim().trim_end_matches('/').to_string())
         .filter(|raw| !raw.is_empty());
-    let code_env = std::env::var("REGISTRATION_RELAY_CODE")
+    // The code is a credential: REGISTRATION_RELAY_CODE_FILE (a mounted secret file) is
+    // preferred over the REGISTRATION_RELAY_CODE environment variable.
+    let code_env = std::env::var("REGISTRATION_RELAY_CODE_FILE")
         .ok()
+        .filter(|path| !path.trim().is_empty())
+        .and_then(|path| match std::fs::read_to_string(path.trim()) {
+            Ok(text) => Some(text),
+            Err(e) => {
+                tracing::error!("cannot read REGISTRATION_RELAY_CODE_FILE: {e}");
+                None
+            }
+        })
+        .or_else(|| std::env::var("REGISTRATION_RELAY_CODE").ok())
         .map(|raw| raw.trim().to_string())
         .filter(|raw| !raw.is_empty());
 
