@@ -51,6 +51,10 @@ where
 
     let listen = config.listen;
     let files = config.files.clone();
+    let (max_upload, spool_dir) = match &files {
+        Some(f) => (f.limits.max_file_bytes, f.dir.join("outbound")),
+        None => (100 << 20, config.data_dir.join("attachments-out")),
+    };
     let bus = EventBus::new();
     let store = StateStore::load(
         config.data_dir.join("state.plist"),
@@ -94,7 +98,9 @@ where
         tracing::info!("attachments disabled (IMESSAGE_FILE_HMAC_KEY_FILE not set)");
     }
 
-    let app = api::router(Arc::new(api::AppState::new(store, backend, bus)));
+    let app = api::router(Arc::new(
+        api::AppState::new(store, backend, bus).with_uploads(max_upload, spool_dir),
+    ));
 
     let listener = tokio::net::TcpListener::bind(listen).await?;
     tracing::info!("listening on http://{listen}");

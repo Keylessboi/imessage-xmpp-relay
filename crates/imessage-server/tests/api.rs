@@ -362,3 +362,121 @@ async fn status_surfaces_login_diagnostics() {
     assert_eq!(body["login_error"], serde_json::json!(null));
     assert_eq!(body["last_login_attempt"], serde_json::json!(null));
 }
+
+// ---- POST /im/attachment (additive) -------------------------------------
+
+struct RecordingBackend {
+    seen: std::sync::Mutex<Vec<(String, Option<String>, String, String, Vec<u8>)>>,
+}
+
+#[async_trait::async_trait]
+impl Backend for RecordingBackend {
+    fn name(&self) -> &'static str {
+        "recording"
+    }
+    async fn start(&self) -> Result<(), BackendError> {
+        Ok(())
+    }
+    async fn send_message(&self, _: &str, _: &str, _: Option<String>) -> Result<String, BackendError> {
+        Err(BackendError::unavailable("n/a"))
+    }
+    async fn register_phone(&self, _: &str, _: &str) -> Result<(), BackendError> {
+        Err(BackendError::unavailable("n/a"))
+    }
+    async fn apns_token(&self) -> Result<String, BackendError> {
+        Err(BackendError::unavailable("n/a"))
+    }
+    fn login_status(&self) -> LoginStatus {
+        LoginStatus::default()
+    }
+    async fn send_attachment(
+        &self,
+        to: &str,
+        chat_guid: Option<&str>,
+        name: &str,
+        mime: &str,
+        path: &std::path::Path,
+    ) -> Result<String, BackendError> {
+        let bytes = std::fs::read(path).unwrap();
+        self.seen.lock().unwrap().push((
+            to.into(),
+            chat_guid.map(str::to_string),
+            name.into(),
+            mime.into(),
+            bytes,
+        ));
+        Ok("GUID-ATT".into())
+    }
+}
+
+fn attach_harness(max: u64) -> (Harness, Arc<RecordingBackend>, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!("ims-att-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let bus = EventBus::new();
+    let store = StateStore::load(dir.join("state.plist"), "me@example.com".into(), bus.clone()).unwrap();
+    store.set_registered(true, vec![]);
+    let rec = Arc::new(RecordingBackend { seen: Default::default() });
+    let backend: Arc<dyn Backend> = rec.clone();
+    let spool = dir.join("spool");
+    let app = api::router(Arc::new(
+        AppState::new(store.clone(), backend, bus.clone()).with_uploads(max, spool.clone()),
+    ));
+    (Harness { app, store, bus }, rec, spool)
+}
+
+fn post_bytes(uri: &str, body: Vec<u8>) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/octet-stream")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn attachment_upload_is_sanitised_spooled_and_cleaned_up() {
+    let (h, rec, spool) = attach_harness(1024);
+    let png = b"\x89PNG\r\n\x1a\n-rest".to_vec();
+    let (status, body) = send(
+        &h,
+        post_bytes("/im/attachment?to=%2B15551234567&name=..%2F..%2Fevil.png&mime=text/html", png.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["guid"], "GUID-ATT");
+    assert_eq!(body["name"], "evil.png");
+    assert_eq!(body["mime"], "image/png");
+    let seen = rec.seen.lock().unwrap();
+    assert_eq!(seen[0].0, "+15551234567");
+    assert_eq!(seen[0].2, "evil.png");
+    assert_eq!(seen[0].4, png);
+    drop(seen);
+    assert_eq!(std::fs::read_dir(&spool).unwrap().count(), 0, "spool file removed");
+}
+
+#[tokio::test]
+async fn attachment_upload_enforces_the_cap_and_requires_a_target() {
+    let (h, rec, spool) = attach_harness(16);
+    let (status, _) = send(&h, post_bytes("/im/attachment?to=%2B1555", vec![0u8; 17])).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(std::fs::read_dir(&spool).unwrap().count(), 0);
+    let (status, _) = send(&h, post_bytes("/im/attachment", vec![1u8; 4])).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = send(&h, post_bytes("/im/attachment?to=%2B1555", vec![])).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(rec.seen.lock().unwrap().is_empty());
+    // group target works with chat_guid alone
+    let (status, _) = send(&h, post_bytes("/im/attachment?chat_guid=iMessage%3B%2B%3Bg", vec![1u8; 4])).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn attachment_upload_is_gated_and_the_stub_names_the_limit() {
+    let h = harness();
+    let (status, body) = send(&h, post_bytes("/im/attachment?to=%2B1555", vec![1u8; 4])).await;
+    assert_eq!((status, body["error"].as_str()), (StatusCode::SERVICE_UNAVAILABLE, Some("not registered")));
+    h.store.set_registered(true, vec![]);
+    let (status, body) = send(&h, post_bytes("/im/attachment?to=%2B1555", vec![1u8; 4])).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(body["error"].as_str().unwrap().contains("attachments"));
+}

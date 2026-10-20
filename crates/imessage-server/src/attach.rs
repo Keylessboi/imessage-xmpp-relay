@@ -173,6 +173,28 @@ fn safe_claimed(claimed: &str) -> String {
     }
 }
 
+/// Apple UTI for an outbound file's (sniffed) mime type; `public.data` when
+/// unknown, which Messages shows as a generic file.
+pub fn uti_for(mime: &str) -> &'static str {
+    match mime {
+        "image/jpeg" => "public.jpeg",
+        "image/png" => "public.png",
+        "image/gif" => "com.compuserve.gif",
+        "image/heic" => "public.heic",
+        "image/webp" => "org.webmproject.webp",
+        "video/mp4" => "public.mpeg-4",
+        "video/quicktime" => "com.apple.quicktime-movie",
+        "application/pdf" => "com.adobe.pdf",
+        "application/zip" => "public.zip-archive",
+        "audio/mpeg" => "public.mp3",
+        "audio/mp4" => "public.mpeg-4-audio",
+        "audio/wav" => "com.microsoft.waveform-audio",
+        "audio/ogg" => "org.xiph.ogg-audio",
+        "audio/x-caf" => "com.apple.coreaudio-format",
+        _ => "public.data",
+    }
+}
+
 /// A `Write` that refuses to take more than `limit` bytes and remembers the
 /// first bytes (for sniffing). MMCS hands us the plaintext through blocking
 /// `Write` calls, so this is where the size cap is enforced for real, whatever
@@ -480,6 +502,14 @@ mod tests {
         assert_eq!(sniff_mime(b"x", "application/javascript"), OCTET_STREAM);
         assert_eq!(sniff_mime(b"x", "not a mime"), OCTET_STREAM);
         assert_eq!(sniff_mime(b"x", "IMAGE/X-Foo"), "image/x-foo");
+    }
+
+    #[test]
+    fn utis_map_known_types_and_default_to_data() {
+        assert_eq!(uti_for("image/jpeg"), "public.jpeg");
+        assert_eq!(uti_for("application/pdf"), "com.adobe.pdf");
+        assert_eq!(uti_for("application/octet-stream"), "public.data");
+        assert_eq!(uti_for(""), "public.data");
     }
 
     #[test]

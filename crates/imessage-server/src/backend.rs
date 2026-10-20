@@ -138,6 +138,24 @@ pub trait Backend: Send + Sync + 'static {
         ))
     }
 
+    /// Upload the file at `path` (already size-capped by the HTTP layer) and
+    /// send it as an attachment to a peer (`to`) or an existing group
+    /// (`chat_guid`). `name` is untrusted and must be sanitised by the backend;
+    /// `mime` is only a hint. Returns the wire guid. Only called when
+    /// registered. Default: unavailable.
+    async fn send_attachment(
+        &self,
+        _to: &str,
+        _chat_guid: Option<&str>,
+        _name: &str,
+        _mime: &str,
+        _path: &std::path::Path,
+    ) -> Result<String, BackendError> {
+        Err(BackendError::unavailable(
+            "this backend cannot send attachments",
+        ))
+    }
+
     /// Mint (or reuse) an Apple FaceTime join link from the registered IDS
     /// identity. Optional `handle` is context only. Default: unavailable.
     async fn facetime_link(&self, _handle: Option<&str>) -> Result<String, BackendError> {
