@@ -48,8 +48,9 @@ Notify = Callable[[IncomingXmpp, str], Awaitable[None]]
 
 def attachment_placeholder(info: dict) -> str:
     """One readable stand-in for an attachment or sticker (bytes are not fetched)."""
-    name = str(info.get("name") or "").strip()
-    mime = str(info.get("mime") or "").strip()
+    # The names come from the sender: the glyph this module replaces must not come back in them.
+    name = str(info.get("name") or "").replace(OBJECT_REPLACEMENT, "").strip()
+    mime = str(info.get("mime") or "").replace(OBJECT_REPLACEMENT, "").strip()
     if info.get("sticker"):
         return "[sticker: " + name + "]" if name else "[sticker]"
     detail = name + (" (" + mime + ")" if name and mime else mime)
@@ -90,6 +91,14 @@ def tapback_text(reaction: str, emoji: Optional[str], enable: bool, quoted: Opti
     return "Removed " + (glyph or "a reaction") + " from " + target
 
 
+def _part(event: dict) -> int:
+    """The message part an edit/unsend targets; anything unreadable counts as part 1 (text-only notice)."""
+    try:
+        return int(event.get("part") or 0)
+    except (TypeError, ValueError):
+        return 1
+
+
 def short(text: str, limit: int = 80) -> str:
     text = " ".join((text or "").split())
     return text if len(text) <= limit else text[: limit - 1] + "…"
@@ -126,15 +135,24 @@ class MessageIndex:
         if not rec.guid:
             return
         old = self._by_guid.pop(rec.guid, None)
-        if old is not None and old.xmpp_id:
-            self._by_xid.pop(old.xmpp_id, None)
+        if old is not None:
+            self._unmap(old)
         self._by_guid[rec.guid] = rec
         if rec.xmpp_id:
             self._by_xid[rec.xmpp_id] = rec.guid
         while len(self._by_guid) > self.maxsize:
             _, evicted = self._by_guid.popitem(last=False)
-            if evicted.xmpp_id and self._by_xid.get(evicted.xmpp_id) == evicted.guid:
-                del self._by_xid[evicted.xmpp_id]
+            self._unmap(evicted)
+
+    def _unmap(self, gone: MsgRec) -> None:
+        """Drop `gone`'s xmpp-id mapping, but only if it is ours; another live record may share the id."""
+        if not gone.xmpp_id or self._by_xid.get(gone.xmpp_id) != gone.guid:
+            return
+        del self._by_xid[gone.xmpp_id]
+        for other in reversed(self._by_guid.values()):
+            if other.xmpp_id == gone.xmpp_id:
+                self._by_xid[gone.xmpp_id] = other.guid
+                break
 
     def by_guid(self, guid: Optional[str]) -> Optional[MsgRec]:
         return self._by_guid.get(guid or "")
@@ -320,6 +338,7 @@ class RichFeatures:
     async def _on_reaction(self, event, sender, frm, is_group, chat_guid) -> None:
         reaction = str(event.get("reaction") or "")
         emoji = event.get("emoji")
+        emoji = None if emoji is None else str(emoji)
         enable = bool(event.get("enable", True))
         to_guid = str(event.get("to_guid") or "")
         rec = self.index.by_guid(to_guid)
@@ -340,7 +359,7 @@ class RichFeatures:
     async def _on_edit(self, event, sender, frm, is_group, chat_guid) -> None:
         guid = str(event.get("guid") or "")
         text = render_attachments(str(event.get("text") or ""), [])
-        part = int(event.get("part") or 0)
+        part = _part(event)
         rec = self.index.by_guid(guid)
         if rec is not None:
             rec.text = text
@@ -354,7 +373,7 @@ class RichFeatures:
 
     async def _on_unsend(self, event, sender, frm, is_group, chat_guid) -> None:
         guid = str(event.get("guid") or "")
-        part = int(event.get("part") or 0)
+        part = _part(event)
         rec = self.index.by_guid(guid)
         if frm is None or is_group or part != 0:
             await self._send(frm=frm, body=self._label(sender, chat_guid, is_group)

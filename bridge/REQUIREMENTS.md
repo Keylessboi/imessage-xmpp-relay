@@ -1,0 +1,211 @@
+# Requirements (keelhaul manifest for bridge/relay pure modules)
+
+Source of truth is `manifest.yaml`; tests are `tests/test_kh_*.py`.
+
+## REQ-XEP-001 - Stanza builders emit well-formed, injection-free XML
+- scope: relay/xep.py
+- driver: tests/test_kh_xep.py
+- behavior: Every XEP builder (receipts, markers, reactions, replies, corrections, retractions, OOB, chat states) serializes to well-formed XML for any XML-legal input; hostile text only ever lands as character data or attribute values and parse_features/parse_oob_url read back exactly what was built.
+- pre: input strings are XML-legal (see REQ-XEP-003)
+- post: serialize(build(x)) re-parses; parse(build(x)) == x; no element beyond those built exists
+- failure: unknown chat state raises ValueError, never an unknown element
+
+## REQ-XEP-002 - Parsing and fallback stripping are total and never eat typed text
+- scope: relay/xep.py
+- driver: tests/test_kh_xep.py
+- behavior: parse_features accepts any element tree (junk attributes, comments, PIs, huge/negative ranges) without raising; strip_fallback removes exactly the union of the declared valid ranges and nothing outside them, however the ranges overlap.
+- pre: any Element / any body string
+- post: strip_fallback(body, f) == body minus union(valid ranges); whole-body fallback gives empty
+- failure: invalid ranges ignored, never raise
+
+## REQ-XEP-003 - xml_safe removes every XML-1.0-illegal character
+- scope: relay/xep.py
+- driver: tests/test_kh_xep.py
+- behavior: xml_safe(text) contains only characters XML 1.0 can carry (no C0 controls except TAB/LF/CR, no lone surrogates, no U+FFFE/U+FFFF), is idempotent and keeps every legal character.
+- pre: any str
+- post: utf-8 encodable, parses inside an element, idempotent
+- failure: none
+
+## REQ-SSRF-001 - check_url judges the host the HTTP client will connect to
+- scope: relay/outbound.py
+- driver: tests/test_kh_outbound.py
+- behavior: A URL the owner posts is accepted only if, as yarl/aiohttp parse it, the scheme is http(s), the port is 80/443 (port 0 is a port), there are no credentials, and the host is a public IP literal or an ASCII DNS name; unicode-dot / fullwidth / circled-digit / inet_aton numeric / percent-encoded host spellings of an IP never pass, and the canonical string is what is fetched.
+- pre: any str
+- post: accepted => yarl host == judged host, public IP or plain name; never a numeric-looking name
+- failure: FetchError, never another exception type
+
+## REQ-SSRF-002 - is_public_ip refuses every non-public address in every spelling
+- scope: relay/outbound.py
+- driver: tests/test_kh_outbound.py
+- behavior: is_public_ip is True only for globally routable unicast addresses; IPv6 addresses that embed an IPv4 one (mapped, IPv4-compatible ::/96, NAT64 64:ff9b::/96, 6to4) are judged by the embedded IPv4.
+- pre: any str
+- post: True => ip.is_global, not multicast, embedded IPv4 global
+- failure: non-address text is False
+
+## REQ-SSRF-003 - DNS answers are all checked at connect time (no rebinding)
+- scope: relay/outbound.py
+- driver: tests/test_kh_outbound.py
+- behavior: PublicOnlyResolver raises on the first non-public answer among any number of A/AAAA records and returns only public ones; an end-to-end fetch through numeric/unicode spellings of 127.0.0.1 never reaches a real loopback listener.
+- pre: resolver answers arbitrary
+- post: every returned host is public
+- failure: OSError on any non-public or empty answer
+
+## REQ-SSRF-004 - Redirects re-validate every hop; size and hop caps hold
+- scope: relay/outbound.py
+- driver: tests/test_kh_outbound.py
+- behavior: Redirects are followed by hand with check_url on every hop (a refused hop is never requested), at most MAX_REDIRECTS hops, the byte cap is enforced while streaming even if Content-Length lies, and no temp file survives a failure.
+- pre: any Location header
+- post: refused hop never requested; <=4 requests; size<=max_bytes
+- failure: FetchError for every refusal
+
+## REQ-MUC-001 - Room JID codec is lossless and canonical
+- scope: relay/muc.py
+- driver: tests/test_kh_muc.py
+- behavior: room_localpart/localpart_to_chat_guid round-trip every group id that can be minted, are case-insensitive, and each room has exactly one spelling (a second spelling of the same group is rejected).
+- pre: any str
+- post: decode(encode(g)) == g; encode(decode(lp)) == lp.lower()
+- failure: None for unencodable input (lone surrogate, too long), never an exception
+
+## REQ-MUC-002 - A room JID never aliases a peer JID
+- scope: relay/muc.py
+- driver: tests/test_kh_muc.py
+- behavior: No room localpart decodes to a peer handle and no peer JID decodes to a group id, for any handle or group id.
+- pre: any handle / group id
+- post: localpart_to_handle(room) is None and jid_to_chat_guid(peer) is None
+- failure: None
+
+## REQ-MUC-003 - Every stanza the MUC service emits is well-formed and structurally fixed
+- scope: relay/muc.py
+- driver: tests/test_kh_muc.py
+- behavior: For hostile message text, group names, handles, URLs and timestamps, every raw stanza sent re-parses, contains only the expected element kinds, and the hostile text appears only as data; XML-illegal characters are stripped at the send boundary; an out-of-range timestamp never aborts history replay.
+- pre: any iMessage-side data
+- post: ET.fromstring(raw) succeeds for every raw stanza
+- failure: none
+
+## REQ-MUC-004 - Only the owner can drive rooms
+- scope: relay/muc.py
+- driver: tests/test_kh_muc.py
+- behavior: Message, presence and iq stanzas from any JID other than the owner (look-alike spellings included) cause no upstream call, no state change and no grant; the owner is served in any case spelling.
+- pre: stanza from any JID
+- post: api.calls == [] and room state unchanged for non-owner
+- failure: silently ignored
+
+## REQ-MUC-005 - History selection, paging and stamps are total and bounded
+- scope: relay/muc.py
+- driver: tests/test_kh_muc.py
+- behavior: select_history returns an ordered subsequence honouring maxstanzas; page never exceeds max_; parse_history_request never raises on hostile attributes; format_stamp is total over all floats.
+- pre: any request/timestamp
+- post: subsequence, bounds respected, stamp round-trips
+- failure: no exception
+
+## REQ-MUC-006 - Rooms fail closed when OMEMO is on
+- scope: relay/muc.py
+- driver: tests/test_kh_muc.py
+- behavior: maybe_make_group_service returns None (no plaintext rooms) when XMPP_OMEMO is on or XMPP_GROUPS_MUC is off.
+- pre: cfg.omemo true
+- post: service is None
+- failure: none
+
+## REQ-MUC-007 - Owner-supplied room file URLs only go through the SSRF guard
+- scope: relay/muc.py
+- driver: tests/test_kh_muc.py
+- behavior: An XEP-0066 URL posted into a room is fetched only through fetch_to_tempfile; a refused URL never reaches send_attachment and is answered with an error stanza; draft rooms refuse before any fetch; the temp file is removed after a successful hand-over.
+- pre: owner stanza with any URL
+- post: no send_attachment call for a refused URL; temp file unlinked
+- failure: error stanza, no exception
+
+## REQ-RICH-001 - The guid <-> xmpp-id index is bounded and never lies
+- scope: relay/rich.py
+- driver: tests/test_kh_rich.py
+- behavior: MessageIndex holds at most maxsize records; every xmpp-id mapping points to a live record that carries that id; a record whose id is shared stays reachable when another sharer is replaced or evicted.
+- pre: any sequence of remember()
+- post: bounded; no dangling or lying mapping
+- failure: none
+
+## REQ-RICH-002 - Reaction sets are bounded and copies
+- scope: relay/rich.py
+- driver: tests/test_kh_rich.py
+- behavior: ReactionSets holds at most maxsize sets, never duplicates an emoji, never stores an empty set, and hands out copies.
+- pre: any sequence of apply/set
+- post: bounded, duplicate-free
+- failure: none
+
+## REQ-RICH-003 - Attachment placeholders never leak U+FFFC
+- scope: relay/rich.py
+- driver: tests/test_kh_rich.py
+- behavior: render_attachments replaces every U+FFFC with a placeholder (extra attachments are appended), and sender-supplied names/mime types cannot reintroduce the glyph.
+- pre: any text / attachment dicts
+- post: no U+FFFC in output; placeholder count >= max(glyphs, attachments)
+- failure: none
+
+## REQ-RICH-004 - Feature events are total, owner-addressed and cannot edit inbound messages
+- scope: relay/rich.py
+- driver: tests/test_kh_rich.py
+- behavior: Any server event (junk fields, wrong types) is handled without raising; every stanza goes to the owner from a component-domain JID; receipts only for owner-sent messages that asked for them; XMPP edits/retractions of inbound messages are refused with a notice and no upstream action.
+- pre: any event dict
+- post: to == owner; From in component domain; no upstream action for inbound targets
+- failure: notice to owner
+
+## REQ-CALL-001 - Call rate limit holds and a retry rings once
+- scope: relay/calls.py
+- driver: tests/test_kh_calls.py
+- behavior: RateLimiter allows at most `burst` events in any sliding `window`; post_link never rings more than the limit allows and still answers the owner; the session-id memory is bounded and a repeated propose is declined again but never rings twice.
+- pre: any clock sequence
+- post: <= burst per window; |seen| <= 256
+- failure: rate-limited text, no link in it
+
+## REQ-CALL-002 - Jingle/disco stanza builders are well-formed and verbatim
+- scope: relay/calls.py
+- driver: tests/test_kh_calls.py
+- behavior: build_reject/iq_result/session_terminate/disco_info parse for any legal ids and JIDs and carry them verbatim; XML-illegal characters are stripped before any raw send; payload sniffers never raise.
+- pre: any ids
+- post: parses; attrs verbatim
+- failure: none
+
+## REQ-CALL-003 - Only the component's own JIDs can start a call
+- scope: relay/calls.py
+- driver: tests/test_kh_calls.py
+- behavior: A propose or text command addressed to any JID that is not the component or one of its contacts causes no upstream call and no message.
+- pre: any `to` JID
+- post: up.calls == [] and no message
+- failure: ignored
+
+## REQ-ATT-001 - Only the server's signed /dl path becomes a URL
+- scope: relay/attachments.py
+- driver: tests/test_kh_attachments.py
+- behavior: build_url returns base+path iff path fully matches /dl/<32 hex>?exp=<digits>&sig=<64 hex> (a trailing newline does not match); the result has no whitespace or control characters.
+- pre: any path
+- post: fullmatch <=> URL
+- failure: None
+
+## REQ-ATT-002 - Attachment delivery targets only configured recipients and never spoofs
+- scope: relay/attachments.py
+- driver: tests/test_kh_attachments.py
+- behavior: plan_attachment_delivery addresses only cfg.targets, body is the URL, From is None for groups and otherwise a component-domain JID; a delivery failure is counted, not raised.
+- pre: any sender/chat
+- post: to in targets; no foreign From
+- failure: stats counters
+
+## REQ-DEDUP-001 - The replay cache is bounded and exact
+- scope: relay/dedup.py
+- driver: tests/test_kh_attachments.py
+- behavior: DedupCache returns True exactly once per key within its capacity, evicts in LRU order, never exceeds maxsize, and always delivers key-less messages.
+- pre: any key sequence
+- post: matches an LRU model
+- failure: ValueError for maxsize < 1
+
+## REQ-OMEMO-001 - The opportunistic plaintext policy is sticky and never downgrades
+- scope: relay/component_omemo.py
+- driver: tests/test_kh_omemo.py
+- behavior: plaintext_allowed(p) is true only under `opportunistic` and only until one message in the conversation was encrypted in either direction; the flag is keyed by case/resource-insensitive bare JID, persists across restarts, is set only by successful crypto, and `required` never allows plaintext.
+- pre: any op sequence incl. restarts
+- post: matches the sticky-set model; monotone
+- failure: failed crypto leaves state unchanged
+
+## REQ-OMEMO-002 - The emulated PEP is read-only and refuses unknown nodes
+- scope: relay/component_omemo.py
+- driver: tests/test_kh_omemo.py
+- behavior: The advertised PEP features never include publish, unknown nodes are item-not-found, and only NoOmemoDevices (not a timeout or lookup failure) is the plaintext trigger.
+- pre: any node
+- post: no #publish feature
+- failure: PepError item-not-found

@@ -31,3 +31,8 @@ aka-oracle/build/
 # Machine state (registration, keys, relay secret) — never commit.
 data/
 relay-secret
+
+# keelhaul scratch (state + measure workdir)
+bridge/.keelhaul/work/
+bridge/.keelhaul/state.json
+bridge/mcdc/

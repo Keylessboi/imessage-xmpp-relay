@@ -18,6 +18,7 @@ take the built elements via `append` and be parsed with `parse_features`.
 """
 from __future__ import annotations
 
+import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from typing import Optional
@@ -72,6 +73,16 @@ TAPBACK_VERB = {
 
 def _q(ns: str, tag: str) -> str:
     return "{" + ns + "}" + tag
+
+
+# Characters XML 1.0 forbids (C0 controls except tab/LF/CR, lone surrogates, U+FFFE/F).
+# One of them in a stanza makes the whole stanza ill-formed and the server closes the stream.
+_XML_ILLEGAL = re.compile("[^\u0009\u000a\u000d\u0020-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]")
+
+
+def xml_safe(text: str) -> str:
+    """`text` without the characters XML 1.0 cannot carry (untrusted iMessage text goes through this)."""
+    return _XML_ILLEGAL.sub("", text)
 
 
 # -- emoji <-> tapback --------------------------------------------------------
@@ -263,6 +274,8 @@ def parse_features(xml: Optional[ET.Element]) -> Features:
     fallbacks: list[tuple[str, Optional[int], Optional[int]]] = []
     for child in xml:
         tag = child.tag
+        if not isinstance(tag, str):
+            continue  # comment / processing instruction
         if tag == _q(NS_RECEIPTS, "request"):
             values["receipt_request"] = True
         elif tag == _q(NS_RECEIPTS, "received"):
@@ -318,6 +331,13 @@ def strip_fallback(body: str, features: Features) -> str:
             return ""
         if 0 <= start <= end <= len(body):
             remove.append((start, end))
-    for start, end in sorted(remove, reverse=True):
+    # Merge overlaps first: cutting overlapping ranges one after another would eat typed text.
+    merged: list[list[int]] = []
+    for start, end in sorted(remove):
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    for start, end in reversed(merged):
         body = body[:start] + body[end:]
     return body

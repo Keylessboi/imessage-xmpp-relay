@@ -56,7 +56,7 @@ from .logsetup import get_logger
 from .models import IMessageEvent, bare_jid, normalize_handle
 from .outbound import FetchError, fetch_to_tempfile, guess_name
 from .upstream import UpstreamClient, UpstreamError
-from .xep import parse_oob_url
+from .xep import parse_oob_url, xml_safe
 
 log = get_logger("relay.muc")
 
@@ -98,23 +98,28 @@ def room_localpart(chat_guid: str) -> Optional[str]:
     guid = chat_guid or ""
     if not guid:
         return None
-    if _UUID_RE.match(guid):
+    if _UUID_RE.fullmatch(guid):  # not .match: `$` would also accept a trailing newline
         return "grp-u" + guid.replace("-", "").lower()
-    encoded = "grp-x" + guid.encode("utf-8").hex()
+    try:
+        encoded = "grp-x" + guid.encode("utf-8").hex()
+    except UnicodeEncodeError:  # a lone surrogate (JSON "\ud800") has no UTF-8 form
+        return None
     return encoded if len(encoded) <= _MAX_LOCALPART else None
 
 
 def localpart_to_chat_guid(localpart: str) -> Optional[str]:
     """Reverse of room_localpart; None for anything that is not a room localpart."""
     value = (localpart or "").strip().lower()
-    if value.startswith("grp-u") and _HEX32_RE.match(value[5:]):
+    if value.startswith("grp-u") and _HEX32_RE.fullmatch(value[5:]):
         h = value[5:].upper()
         return "-".join((h[:8], h[8:12], h[12:16], h[16:20], h[20:]))
-    if value.startswith("grp-x") and _HEX_RE.match(value[5:]):
+    if value.startswith("grp-x") and _HEX_RE.fullmatch(value[5:]):
         try:
-            return bytes.fromhex(value[5:]).decode("utf-8")
+            guid = bytes.fromhex(value[5:]).decode("utf-8")
         except UnicodeDecodeError:
             return None
+        # One spelling per room: a UUID spelled grp-x<hex> (or a guid too long to mint) is not ours.
+        return guid if room_localpart(guid) == value else None
     return None
 
 
@@ -144,8 +149,15 @@ def display_name(name: Optional[str], participants: list[str], mine: set[str]) -
     return label + (" +" + str(len(others) - 3) if len(others) > 3 else "")
 
 
+_MIN_STAMP = 0.0              # the epoch: earlier stamps mean nothing for chat history
+_MAX_STAMP = 253402300799.0   # 9999-12-31T23:59:59Z
+
+
 def format_stamp(ts: float) -> str:
     """XEP-0082 UTC datetime for a XEP-0203 delay stamp."""
+    # A timestamp outside 1970..9999 (or NaN) would raise and abort every later history replay.
+    if not (_MIN_STAMP <= ts <= _MAX_STAMP):
+        ts = _MIN_STAMP if ts < 0 else _MAX_STAMP if ts == ts else 0.0
     return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
@@ -400,7 +412,10 @@ class GroupService:
             log.exception("group stanza handler failed", event="muc_error", stanza=what)
 
     async def _send(self, xml: str) -> None:
-        result = self.xmpp.send_raw(xml)
+        # Message text, names and handles come from iMessage; one XML-illegal character
+        # (NUL, ESC, a lone surrogate...) would make the stanza ill-formed and the server
+        # would drop the component stream. Every structural character is legal, so filter all.
+        result = self.xmpp.send_raw(xml_safe(xml))
         if asyncio.isfuture(result) or asyncio.iscoroutine(result):
             await result
 

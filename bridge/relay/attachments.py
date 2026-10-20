@@ -27,7 +27,7 @@ _PATH_RE = re.compile(r"^/dl/[0-9a-f]{32}\?exp=[0-9]{1,12}&sig=[0-9a-f]{64}$")
 
 def build_url(base: str, path: str) -> Optional[str]:
     """base + path, or None when the base is unset or the path is not a signed /dl path."""
-    if not base or not _PATH_RE.match(path or ""):
+    if not base or not _PATH_RE.fullmatch(path or ""):  # `$` in match() would let a trailing newline through
         return None
     return base.rstrip("/") + path
 

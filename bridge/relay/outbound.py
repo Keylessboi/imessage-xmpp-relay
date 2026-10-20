@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import os
+import re
 import socket
 import tempfile
 from typing import Optional
@@ -41,43 +42,73 @@ class FetchError(Exception):
     """The URL was refused or could not be fetched (message is safe to show the owner)."""
 
 
+# A DNS name as the connector will resolve it: ASCII labels only (yarl has already IDNA-encoded it).
+_NAME_RE = re.compile(r"^[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?(\.[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?)*\.?$")
+_NAT64 = ipaddress.ip_network("64:ff9b::/96")
+
+
+def _embedded_ipv4(ip: "ipaddress.IPv6Address") -> Optional["ipaddress.IPv4Address"]:
+    """The IPv4 address an IPv6 one carries: mapped, compatible (::/96) or NAT64 (64:ff9b::/96)."""
+    if ip.ipv4_mapped is not None:
+        return ip.ipv4_mapped
+    if int(ip) >> 32 == 0 or ip in _NAT64:
+        return ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+    return None
+
+
 def is_public_ip(value: str) -> bool:
     try:
         ip = ipaddress.ip_address(value)
     except ValueError:
         return False
-    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
-        ip = ip.ipv4_mapped
+    if isinstance(ip, ipaddress.IPv6Address):
+        embedded = _embedded_ipv4(ip)
+        if embedded is not None:
+            # An address that merely wraps an IPv4 one is as public as that IPv4 one
+            # (NAT64 or a v4-in-v6 stack would reach the wrapped host).
+            ip = embedded
     # is_global already excludes private, loopback, link-local, reserved and
     # CGNAT (100.64/10); multicast is excluded explicitly.
     return ip.is_global and not ip.is_multicast
 
 
 def check_url(url: str) -> tuple[str, str]:
-    """Validate a URL up front; returns (url, host). Raises FetchError."""
+    """Validate a URL up front; returns (canonical url, host). Raises FetchError.
+
+    The host is judged the way the HTTP client will see it: parsed with yarl (which
+    NFKC/IDNA-normalises, so "127。0。0。1" IS 127.0.0.1 and aiohttp connects to such a
+    literal without asking the resolver), and the canonical string is what is fetched.
+    """
     try:
-        parts = urlsplit(url.strip())
-        port = parts.port
-    except ValueError:
+        text = url.strip()
+        parts = urlsplit(text)
+        parts.port  # noqa: B018 - validates the port
+        y = URL(text)
+    except ValueError:  # includes UnicodeError from IDNA
         raise FetchError("not a valid URL") from None
-    if parts.scheme not in ("http", "https"):
+    if parts.scheme not in ("http", "https") or y.scheme not in ("http", "https"):
         raise FetchError("only http and https URLs can be sent")
-    host = parts.hostname or ""
+    host = y.raw_host or ""
     if not host:
         raise FetchError("the URL has no host")
-    if parts.username or parts.password:
+    if parts.username or parts.password or y.user or y.password:
         raise FetchError("URLs with credentials are refused")
-    effective = port or (443 if parts.scheme == "https" else 80)
+    port = y.explicit_port  # 0 is a port too: `or` would read ":0" as the default
+    effective = port if port is not None else (443 if y.scheme == "https" else 80)
     if effective not in ALLOWED_PORTS:
         raise FetchError("only ports 80 and 443 are allowed")
     try:
         ipaddress.ip_address(host)
     except ValueError:
-        pass  # a name: the resolver checks it at connect time
+        # A name. Numeric-looking names ("2130706433", "0x7f.1", "127.1") are IPv4 in
+        # disguise to inet_aton; the resolver would catch them, but refuse them here too.
+        last = host.rstrip(".").rsplit(".", 1)[-1]
+        if last.isdigit() or last.startswith("0x") or not _NAME_RE.match(host) or len(host) > 254:
+            raise FetchError("that host name is not acceptable") from None
     else:
         if not is_public_ip(host):
             raise FetchError("that address is not publicly routable")
-    return url.strip(), host
+    return str(y), host
 
 
 class PublicOnlyResolver(AbstractResolver):
@@ -171,7 +202,11 @@ async def _get(session, url: str, out, max_bytes: int, timeout: float) -> tuple[
                 location = resp.headers.get("Location") or ""
                 if not location:
                     raise FetchError("redirect without a location")
-                url, _ = check_url(str(resp.url.join(URL(location))))
+                try:
+                    nxt = resp.url.join(URL(location))
+                except ValueError:
+                    raise FetchError("redirect to an invalid URL") from None
+                url, _ = check_url(str(nxt))
                 continue
             if resp.status != 200:
                 raise FetchError("the file server answered HTTP " + str(resp.status))

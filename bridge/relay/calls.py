@@ -44,6 +44,7 @@ from .config import Config
 from .logsetup import get_logger
 from .models import bare_jid
 from .upstream import UpstreamError
+from .xep import xml_safe
 
 log = get_logger("relay.calls")
 
@@ -206,7 +207,7 @@ class CallService:
         return True
 
     async def _raw(self, xml: str) -> None:
-        result = self._send_raw(xml)
+        result = self._send_raw(xml_safe(xml))
         if hasattr(result, "__await__"):
             await result
 

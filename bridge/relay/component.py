@@ -35,7 +35,7 @@ from .config import Config
 from .logsetup import get_logger
 from .models import IncomingXmpp, bare_jid, normalize_handle
 from .upstream import Backoff
-from .xep import parse_features, parse_oob_url, strip_fallback
+from .xep import parse_features, parse_oob_url, strip_fallback, xml_safe
 from .xmpp_side import IncomingHandler
 
 log = get_logger("relay.component")
@@ -83,7 +83,10 @@ def handle_to_localpart(handle: str) -> Optional[str]:
         if ch in _SAFE_LOCALPART:
             encoded_parts.append(ch)
         else:
-            encoded_parts.extend("-" + format(byte, "02x") for byte in ch.encode("utf-8"))
+            try:
+                encoded_parts.extend("-" + format(byte, "02x") for byte in ch.encode("utf-8"))
+            except UnicodeEncodeError:
+                return None  # a lone surrogate (JSON "\ud800"): no JID can carry it
     encoded = "".join(encoded_parts)
     if not encoded or len(encoded) > _MAX_LOCALPART:
         return None
@@ -277,7 +280,7 @@ class ComponentTransport:
             "{%s}iq/{http://jabber.org/protocol/disco#info}query" % ns), self._on_disco_iq))
 
     async def send_raw(self, xml: str) -> None:
-        result = self.xmpp.send_raw(xml)
+        result = self.xmpp.send_raw(xml_safe(xml))
         if asyncio.isfuture(result) or asyncio.iscoroutine(result):
             await result
 
@@ -359,6 +362,7 @@ class ComponentTransport:
         target = (to or "").strip()
         if not target:
             raise ValueError("refusing to send a stanza without a destination")
+        body = xml_safe(body or "")  # iMessage text may carry characters XML cannot
         if bare_jid(target) == bare_jid(self.cfg.component_jid):
             log.warning(
                 "refusing to send a stanza to the component itself",

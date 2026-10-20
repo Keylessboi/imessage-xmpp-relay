@@ -556,6 +556,19 @@ implements the frozen upstream contract on a random localhost port. Proven:
 The suite collects **144 tests**; all pass offline, with no real XMPP server and
 no network.
 
+### Requirements-traced property tests (keelhaul)
+
+`tests/test_kh_*.py` are drivers for the `keelhaul` harness (`manifest.yaml` /
+`REQUIREMENTS.md` list 26 REQ-IDs over the pure security-relevant modules: `xep`,
+`outbound` (SSRF guard), `muc`, `rich`, `calls`, `attachments`, `dedup`,
+`component_omemo`). Under pytest they run hypothesis properties
+(`KH_EXAMPLES=n` sets the budget, default 300 per property; the suite adds about
+75 s); as keelhaul drivers (`python -m trace`) they run a seeded loop of the same
+property functions and replay the repo's own tests against the traced unit.
+Honest tier: Python is statement-level only under keelhaul (`degraded`, never
+MC/DC); fuzzing here is hypothesis, bounded, not a correctness proof. Not proven:
+anything needing a real XMPP server, real Apple, or real DNS.
+
 ### Live verification (2026-10-19)
 
 Component mode was run end to end against a real **ejabberd 26.9.0**:
