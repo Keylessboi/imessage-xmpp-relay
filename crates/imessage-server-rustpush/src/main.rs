@@ -6,6 +6,7 @@
 //! for config + endpoints.
 
 mod backend;
+mod groups;
 mod sentlog;
 mod sms2fa;
 
