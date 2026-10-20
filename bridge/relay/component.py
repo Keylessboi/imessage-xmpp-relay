@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import re
 from typing import Any, Optional, Sequence
+from xml.etree import ElementTree as ET
 
 from .config import Config
 from .logsetup import get_logger
@@ -38,6 +39,21 @@ from .xep import parse_features, strip_fallback
 from .xmpp_side import IncomingHandler
 
 log = get_logger("relay.component")
+
+# OMEMO wire elements (OMEMO 2 and legacy) and the helper elements around them.
+OMEMO2_ENCRYPTED_TAG = "{urn:xmpp:omemo:2}encrypted"
+LEGACY_ENCRYPTED_TAG = "{eu.siacs.conversations.axolotl}encrypted"
+HINTS_NS = "urn:xmpp:hints"
+EME_NS = "urn:xmpp:eme:0"
+OMEMO_FALLBACK_BODY = (
+    "I sent you an OMEMO encrypted message but your client doesn't seem to "
+    "support that. Find more information on https://conversations.im/omemo"
+)
+PUBSUB_NS = "http://jabber.org/protocol/pubsub"
+DISCO_INFO_NS = "http://jabber.org/protocol/disco#info"
+DISCO_ITEMS_NS = "http://jabber.org/protocol/disco#items"
+# How long to wait for the owner's server to answer a device-list/bundle fetch.
+IQ_TIMEOUT = 15.0
 
 # E.164-ish: a leading + and 7..15 digits, the first of them nonzero.
 E164_RE = re.compile(r"^\+[1-9][0-9]{6,14}$")
@@ -133,6 +149,14 @@ def jid_to_handle(jid: str, domain: str) -> Optional[str]:
     return localpart_to_handle(localpart)
 
 
+def _is_reaction_payload(element: Any) -> bool:
+    """A XEP-0444 reactions element, or the XEP-0428 fallback marker that points at it."""
+    tag = getattr(element, "tag", "")
+    if tag == "{urn:xmpp:reactions:0}reactions":
+        return True
+    return tag == "{urn:xmpp:fallback:0}fallback" and element.get("for") == "urn:xmpp:reactions:0"
+
+
 class ComponentTransport:
     """XmppTransport implemented with slixmpp's ComponentXMPP (XEP-0114).
 
@@ -160,6 +184,8 @@ class ComponentTransport:
             jitter=cfg.backoff_jitter,
         )
         self._owner = bare_jid(cfg.component_owner)
+        self._omemo: Optional[Any] = None  # ComponentOmemo once started (OMEMO on)
+        self._omemo_failed = False
 
         if xmpp is None:
             import slixmpp  # imported lazily so tests can inject a fake
@@ -181,6 +207,14 @@ class ComponentTransport:
         self.xmpp.add_event_handler("presence_subscribe", self._on_presence_subscribe)
         self.xmpp.add_event_handler("presence_probe", self._on_presence_probe)
         self.xmpp.add_event_handler("disconnected", self._on_disconnected)
+        if self.cfg.omemo:
+            from slixmpp.xmlstream.handler import CoroutineCallback
+            from slixmpp.xmlstream.matcher import StanzaPath
+
+            # Components have no PEP: the bridge answers disco/pubsub GETs itself.
+            self.xmpp.register_handler(
+                CoroutineCallback("omemo-iq-get", StanzaPath("iq@type=get"), self._on_iq_get)
+            )
 
     def set_incoming_handler(self, handler: IncomingHandler) -> None:
         self._handler = handler
@@ -188,6 +222,8 @@ class ComponentTransport:
     # -- XmppTransport -----------------------------------------------------
 
     async def start(self) -> None:
+        if self.cfg.omemo:
+            await self._start_omemo()
         loop = asyncio.get_running_loop()
         self._disconnected = asyncio.Event()
         while not self._stopping:
@@ -227,6 +263,11 @@ class ComponentTransport:
 
     async def stop(self) -> None:
         self._stopping = True
+        if self._omemo is not None:
+            try:
+                await self._omemo.close()
+            except Exception:  # noqa: BLE001
+                log.debug("OMEMO shutdown raised", exc_info=True, event="omemo_shutdown_error")
         # Wake start() if it is still waiting for a handshake that will never
         # come (e.g. stopping right after a rejected connection).
         if self._session_started is not None and not self._session_started.done():
@@ -274,6 +315,12 @@ class ComponentTransport:
                     frm=sender,
                 )
                 sender = self.cfg.component_jid
+        if self.cfg.omemo and mtype in ("chat", "normal"):
+            # 1:1 traffic is encrypted or not delivered: never plaintext.
+            await self._send_omemo_stanza(
+                to=target, body=body, mtype=mtype, sender=sender, msg_id=msg_id, elements=elements
+            )
+            return
         msg = self.xmpp.make_message(mto=target, mbody=body or None, mtype=mtype, mfrom=sender)
         if msg_id:
             msg["id"] = msg_id
@@ -281,6 +328,242 @@ class ComponentTransport:
             # Feature payloads (receipts, reactions, ...) are plain etree elements.
             msg.xml.append(element)
         await self._send(msg)
+
+    # -- OMEMO -----------------------------------------------------------------
+
+    async def _start_omemo(self) -> None:
+        from .component_omemo import ComponentOmemo
+        from .omemo2 import Omemo2Error
+
+        omemo = ComponentOmemo(self.cfg, fetcher=self)
+        try:
+            await omemo.start()
+        except Exception as exc:  # noqa: BLE001 - a broken store must not kill the service
+            # Fail closed: _omemo stays None, so no message is sent in plaintext
+            # and every encrypted stanza / OMEMO IQ is refused.
+            self._omemo_failed = True
+            log.error(
+                "OMEMO initialisation failed; messages will NOT be sent in plaintext",
+                event="omemo_init_error",
+                error=str(exc) if isinstance(exc, Omemo2Error) else type(exc).__name__,
+            )
+            return
+        self._omemo = omemo
+        log.info("component OMEMO ready", event="omemo_ready", store_mode="0600")
+
+    async def fetch_item_payload(
+        self, *, frm: str, to: str, node: str, item_id: Optional[str] = None
+    ) -> Optional[ET.Element]:
+        """ItemFetcher: a pubsub items GET from `frm` to `to` over the component stream."""
+        from slixmpp.exceptions import IqError, IqTimeout
+
+        from .omemo2 import Omemo2Error
+
+        pubsub = ET.Element("{" + PUBSUB_NS + "}pubsub")
+        items = ET.SubElement(pubsub, "{" + PUBSUB_NS + "}items", {"node": node})
+        if item_id is not None:
+            ET.SubElement(items, "{" + PUBSUB_NS + "}item", {"id": item_id})
+        else:
+            items.set("max_items", "1")
+        iq = self.xmpp.make_iq_get(ito=to, ifrom=frm)
+        iq.xml.append(pubsub)
+        try:
+            reply = await iq.send(timeout=IQ_TIMEOUT)
+        except IqTimeout as exc:
+            raise Omemo2Error("timed out fetching " + node + " from " + to) from exc
+        except IqError as exc:
+            if exc.condition in ("item-not-found", "service-unavailable"):
+                return None
+            raise Omemo2Error("fetching " + node + " from " + to + " failed: " + str(exc.condition)) from exc
+        item = reply.xml.find(
+            "{" + PUBSUB_NS + "}pubsub/{" + PUBSUB_NS + "}items/{" + PUBSUB_NS + "}item"
+        )
+        if item is None or len(item) == 0:
+            return None
+        return item[0]
+
+    async def _send_omemo_stanza(
+        self, *, to: str, body: str, mtype: str, sender: str, msg_id: Optional[str], elements: Sequence[Any]
+    ) -> None:
+        """OMEMO policy for stanzas that carry feature payloads (receipts, reactions, replies...).
+
+        Content never travels in clear: a body is always encrypted. Of the payload
+        elements only id-bearing metadata rides the outer stanza (markers, receipt
+        requests, replies/corrections/retractions, chat states). A reactions element
+        carries the emoji itself, so it is dropped (the encrypted fallback body says
+        the same thing). Body-less stanzas (typing, receipts, displayed markers) have
+        no text to protect and go out as-is: they leak only that the owner is
+        typing/reading, which XEP-0384 accepts for chat states.
+        """
+        keep = [e for e in elements if not _is_reaction_payload(e)]
+        if not (body or "").strip():
+            if len(keep) != len(elements):
+                log.warning("dropping a reaction with no encrypted fallback body", event="omemo_reaction_dropped", to=to)
+                return
+            if not keep:
+                return
+            msg = self.xmpp.make_message(mto=to, mtype=mtype, mfrom=sender)
+            if msg_id:
+                msg["id"] = msg_id
+            for element in keep:
+                msg.xml.append(element)
+            await self._send(msg)
+            return
+        await self._send_encrypted(
+            to=to, body=body, mtype=mtype, sender=sender, msg_id=msg_id, elements=keep, plain_elements=elements
+        )
+
+    async def _send_encrypted(
+        self,
+        *,
+        to: str,
+        body: str,
+        mtype: str,
+        sender: str,
+        msg_id: Optional[str] = None,
+        elements: Sequence[Any] = (),
+        plain_elements: Optional[Sequence[Any]] = None,
+    ) -> None:
+        from .omemo2 import NoOmemoDevices, Omemo2Error
+
+        try:
+            if self._omemo is None:
+                raise Omemo2Error("OMEMO is enabled but not initialised")
+            try:
+                encrypted = await self._omemo.encrypt(body, peer_jid=bare_jid(sender), to_jid=to)
+            except NoOmemoDevices:
+                # Only an explicit opportunistic policy, on a conversation that was
+                # never encrypted, may fall back; everything else is fail-closed.
+                if not await self._omemo.plaintext_allowed(bare_jid(sender)):
+                    raise
+                log.info(
+                    "recipient advertises no OMEMO device; sending in plaintext (opportunistic policy)",
+                    event="omemo_plaintext_sent",
+                    to=to,
+                    frm=sender,
+                )
+                plain = self.xmpp.make_message(mto=to, mbody=body, mtype=mtype, mfrom=sender)
+                if msg_id:
+                    plain["id"] = msg_id
+                for element in (elements if plain_elements is None else plain_elements):
+                    plain.xml.append(element)
+                await self._send(plain)
+                return
+        except Exception as exc:  # noqa: BLE001 - every failure is fail-closed
+            log.error(
+                "could not encrypt; the message was NOT sent (no plaintext fallback)",
+                event="omemo_send_failed",
+                to=to,
+                frm=sender,
+                error=str(exc) if isinstance(exc, Omemo2Error) else type(exc).__name__,
+            )
+            await self._send_failure_notice(to=to, sender=sender)
+            raise Omemo2Error("message to " + to + " not delivered: OMEMO encryption failed") from exc
+
+        # One stanza carries every backend's <encrypted/> (each device has a key in
+        # exactly one of them), so a device never sees a second, keyless copy.
+        msg = self.xmpp.make_message(mto=to, mbody=OMEMO_FALLBACK_BODY, mtype=mtype, mfrom=sender)
+        if msg_id:
+            msg["id"] = msg_id
+        for element in encrypted:
+            msg.xml.append(element)
+        for element in elements:
+            msg.xml.append(element)
+        ET.SubElement(msg.xml, "{" + HINTS_NS + "}store")
+        namespace = encrypted[0].tag[1:].split("}", 1)[0]
+        ET.SubElement(msg.xml, "{" + EME_NS + "}encryption", {"namespace": namespace, "name": "OMEMO"})
+        await self._send(msg)
+
+    async def _send_failure_notice(self, *, to: str, sender: str) -> None:
+        """Tell the owner (plaintext, no content) that a message was withheld."""
+        if self._omemo is not None and not self._omemo.notice_due(bare_jid(sender)):
+            return
+        text = (
+            "A message from this contact could not be delivered encrypted "
+            "(no OMEMO device found for you, or the lookup failed). It was NOT "
+            "sent unencrypted. Enable OMEMO in your client and check that its "
+            "device list is public."
+        )
+        try:
+            msg = self.xmpp.make_message(mto=to, mbody=text, mtype="chat", mfrom=sender)
+            await self._send(msg)
+        except Exception:  # noqa: BLE001
+            log.debug("could not send the OMEMO failure notice", exc_info=True, event="omemo_notice_error")
+
+    async def _send_refusal(self, *, owner_msg, text: str) -> None:
+        """An error-type reply to the owner's stanza, from the peer JID it was sent to."""
+        try:
+            err = self.xmpp.make_message(
+                mto=str(owner_msg["from"]), mtype="error", mfrom=str(owner_msg["to"])
+            )
+            err["id"] = str(owner_msg["id"] or "")
+            err["error"]["type"] = "modify"
+            err["error"]["condition"] = "not-acceptable"
+            err["error"]["text"] = text
+            await self._send(err)
+        except Exception:  # noqa: BLE001
+            log.debug("could not send the refusal", exc_info=True, event="omemo_refusal_error")
+
+    # -- IQ (PEP emulation) -------------------------------------------------------
+
+    async def _on_iq_get(self, iq) -> None:
+        try:
+            await self._handle_iq_get(iq)
+        except Exception:  # noqa: BLE001 - never leave an IQ unanswered
+            log.exception("failed to answer an IQ", event="component_iq_error")
+            try:
+                await self._reply_iq_error(iq, "internal-server-error", "wait")
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def _handle_iq_get(self, iq) -> None:
+        from .component_omemo import PepError, disco_info_result, disco_items_result
+
+        sender = bare_jid(str(iq["from"] or ""))
+        target = bare_jid(str(iq["to"] or ""))
+        if sender != self._owner:
+            log.warning(
+                "DENYING IQ from a non-owner JID",
+                event="component_iq_denied",
+                from_jid=str(iq["from"] or ""),
+            )
+            await self._reply_iq_error(iq, "service-unavailable", "cancel")
+            return
+        if self._omemo is None:
+            await self._reply_iq_error(iq, "service-unavailable", "cancel", "OMEMO unavailable")
+            return
+        if not self._omemo.is_peer(target):
+            await self._reply_iq_error(iq, "service-unavailable", "cancel")
+            return
+
+        try:
+            query = iq.xml.find("{" + DISCO_INFO_NS + "}query")
+            if query is not None:
+                payload = disco_info_result(query.get("node"))
+            elif iq.xml.find("{" + DISCO_ITEMS_NS + "}query") is not None:
+                payload = disco_items_result()
+            else:
+                items = iq.xml.find("{" + PUBSUB_NS + "}pubsub/{" + PUBSUB_NS + "}items")
+                if items is None:
+                    await self._reply_iq_error(iq, "feature-not-implemented", "cancel")
+                    return
+                ids = [i.get("id") or "" for i in items.findall("{" + PUBSUB_NS + "}item")]
+                payload = await self._omemo.serve_items(target, items.get("node") or "", ids)
+        except PepError as exc:
+            await self._reply_iq_error(iq, exc.condition, exc.etype, exc.text)
+            return
+        reply = iq.reply()
+        reply.xml.append(payload)
+        await self._send(reply)
+
+    async def _reply_iq_error(self, iq, condition: str, etype: str, text: str = "") -> None:
+        reply = iq.reply()
+        reply["type"] = "error"
+        reply["error"]["condition"] = condition
+        reply["error"]["type"] = etype
+        if text:
+            reply["error"]["text"] = text
+        await self._send(reply)
 
     # -- inbound stanzas ---------------------------------------------------
 
@@ -317,7 +600,9 @@ class ComponentTransport:
             )
             return
 
-        body = msg["body"]
+        body = await self._inbound_body(msg, to_jid=to_jid)
+        if body is None:
+            return
         features = parse_features(getattr(msg, "xml", None))
         text = strip_fallback(str(body), features) if body else ""
         if not text.strip() and not features.interesting:
@@ -348,6 +633,78 @@ class ComponentTransport:
                 retract_id=features.retract_id,
             )
         )
+
+    async def _inbound_body(self, msg, *, to_jid: str):
+        """The text of an owner message: decrypted when OMEMO is on, else the body.
+
+        Returns None when the stanza is dropped (undecryptable, or plaintext
+        while OMEMO is on).  OMEMO never reaches here for a non-owner: the
+        owner check precedes this call.
+        """
+        xml = getattr(msg, "xml", None)  # unit-test fakes carry no XML
+        encrypted = None
+        if xml is not None:
+            # A stanza may carry both backends; OMEMO 2 is tried before legacy.
+            encrypted = [
+                el for el in (xml.find(OMEMO2_ENCRYPTED_TAG), xml.find(LEGACY_ENCRYPTED_TAG))
+                if el is not None
+            ] or None
+        if not self.cfg.omemo:
+            if encrypted is not None:
+                log.warning(
+                    "dropping an OMEMO message: XMPP_OMEMO is off",
+                    event="omemo_disabled_drop",
+                    to_jid=to_jid,
+                )
+                return None
+            return msg["body"]
+
+        if encrypted is None and self._omemo is not None and await self._omemo.plaintext_allowed(bare_jid(to_jid)):
+            log.info(
+                "accepting a plaintext message (opportunistic policy, conversation never encrypted)",
+                event="omemo_plaintext_accepted",
+                to_jid=to_jid,
+            )
+            return msg["body"]
+        if encrypted is None:
+            log.warning(
+                "refusing an unencrypted message while XMPP_OMEMO is on",
+                event="omemo_plaintext_refused",
+                to_jid=to_jid,
+            )
+            if msg["body"]:
+                await self._send_refusal(
+                    owner_msg=msg,
+                    text="XMPP_OMEMO is on: this message was not forwarded because it was not OMEMO-encrypted.",
+                )
+            return None
+        try:
+            if self._omemo is None:
+                raise RuntimeError("OMEMO is not initialised")
+            plaintext = None
+            last_error: Optional[Exception] = None
+            for element in encrypted:
+                try:
+                    plaintext = await self._omemo.decrypt(
+                        element, peer_jid=bare_jid(to_jid), from_jid=str(msg["from"])
+                    )
+                    last_error = None
+                    break
+                except Exception as exc:  # noqa: BLE001 - e.g. no key for us in this element
+                    last_error = exc
+            if last_error is not None:
+                raise last_error
+        except Exception as exc:  # noqa: BLE001 - any failure drops the message
+            log.error(
+                "could not decrypt OMEMO message; dropping it",
+                event="omemo_decrypt_error",
+                from_jid=bare_jid(str(msg["from"])),
+                to_jid=to_jid,
+                error=str(exc) if exc.__class__.__name__ == "Omemo2Error" else type(exc).__name__,
+            )
+            await self._send_refusal(owner_msg=msg, text="could not decrypt this OMEMO message; not forwarded")
+            return None
+        return plaintext  # None for an empty (key transport) message
 
     async def _on_presence_subscribe(self, pres) -> None:
         try:

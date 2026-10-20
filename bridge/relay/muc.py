@@ -1041,6 +1041,15 @@ def maybe_make_group_service(cfg: Config, transport: Any, upstream: UpstreamClie
     """A GroupService for a real component transport, else None (client mode, disabled, fakes)."""
     if cfg.mode != "component" or not groups_enabled():
         return None
+    if cfg.omemo:
+        # Rooms are plaintext XEP-0045 stanzas (no OMEMO for MUC here). With OMEMO on, group
+        # traffic stays on the legacy per-peer 1:1 lines, which are encrypted: fail closed.
+        log.warning(
+            "XMPP_OMEMO is on: group chats are NOT exposed as MUC rooms (rooms would be plaintext); "
+            "using encrypted 1:1 '[group] name' lines instead",
+            event="muc_disabled_by_omemo",
+        )
+        return None
     xmpp = getattr(transport, "xmpp", None)
     if xmpp is None or not hasattr(xmpp, "register_handler"):
         return None

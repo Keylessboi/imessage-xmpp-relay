@@ -137,6 +137,7 @@ class Config:
     omemo: bool = False                    # XMPP_OMEMO: encrypt 1:1 chat
     omemo_store: str = ""                  # XMPP_OMEMO_STORE: identity/session file (required with XMPP_OMEMO)
     omemo_btbv: bool = True                # XMPP_OMEMO_BTBV: auto-trust new devices
+    omemo_policy: str = "required"         # XMPP_OMEMO_POLICY: required | opportunistic (component mode)
 
     # Behaviour
     dedup_size: int = 4096
@@ -232,12 +233,6 @@ class Config:
                 "component mode: the owner JID may send iMessages",
                 event="component_owner_allowed",
                 owner=owner_bare,
-            )
-
-        if _bool(e.get("XMPP_OMEMO")):
-            raise ConfigError(
-                "XMPP_OMEMO=1 is not supported in component mode: an external "
-                "component has no OMEMO device identity; component traffic is plaintext"
             )
 
         return (
@@ -338,6 +333,7 @@ class Config:
             omemo=_bool(e.get("XMPP_OMEMO")),
             omemo_store=(e.get("XMPP_OMEMO_STORE") or "").strip(),
             omemo_btbv=(e.get("XMPP_OMEMO_BTBV") or "1").strip().lower() in ("1", "true", "yes", "on"),
+            omemo_policy=(e.get("XMPP_OMEMO_POLICY") or "required").strip().lower(),
             component_jid=component_jid,
             component_domain=component_domain,
             component_host=component_host,
@@ -377,6 +373,12 @@ class Config:
                 "XMPP_OMEMO_STORE must be set to a writable, persistent file path when "
                 "XMPP_OMEMO=1 (the OMEMO identity must survive restarts)"
             )
+        if self.omemo_policy not in ("required", "opportunistic"):
+            raise ConfigError("XMPP_OMEMO_POLICY must be 'required' or 'opportunistic'")
+        if self.omemo and self.omemo_policy == "opportunistic" and self.mode != "component":
+            raise ConfigError(
+                "XMPP_OMEMO_POLICY=opportunistic is only implemented in component mode"
+            )
         if self.omemo and self.muc:
             log.warning(
                 "XMPP_OMEMO is on but XMPP_MUC is set: group-chat (MUC) messages are NOT "
@@ -411,7 +413,8 @@ class Config:
                 + " allowed=" + (",".join(sorted(self.allowed)) if self.allowed else "<empty: deny all>")
                 + " api_url=" + self.api_url
                 + " default_to=" + str(self.default_to)
-                + " omemo=off"
+                + " omemo=" + ("on" if self.omemo else "off")
+                + (" store=" + self.omemo_store + " policy=" + self.omemo_policy if self.omemo else "")
             )
         return (
             "mode=client"
@@ -425,5 +428,5 @@ class Config:
             + " api_url=" + self.api_url
             + " default_to=" + str(self.default_to)
             + " omemo=" + ("on" if self.omemo else "off")
-            + (" store=" + self.omemo_store if self.omemo else "")
+            + (" store=" + self.omemo_store + " policy=" + self.omemo_policy if self.omemo else "")
         )
