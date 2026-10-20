@@ -1,0 +1,195 @@
+# openbubbles-relay - the registration relay (NAC / validation-data oracle).
+# Source: github.com/Keylessboi/imessage-xmpp-relay; the image comes from that
+# repo's deploy/docker/relay.Dockerfile, built from its root.
+#
+# Runtime contract, read out of the source rather than assumed:
+#   main.rs:115      GET /health -> 200 {"ok":true,"profiles":N}
+#   main.rs:116-117  POST /api/v1/bridge/{get-version-info,get-validation-data},
+#                    authenticated by 'Authorization: Bearer <code>' where the
+#                    code is a key of profiles.json. An unknown code is 404, an
+#                    Apple failure is 502 - the process stays up either way.
+#   main.rs:105-108  profiles.json is read ONCE, before the listener binds, so a
+#                    rotation only takes effect after a pod restart (the secrets
+#                    register records reload: manual for that reason).
+#   main.rs:120      LISTEN, default 0.0.0.0:8787.
+#   nac.rs:143-171   the ~2 MB IMDAppleServices binary is fetched lazily on the
+#                    FIRST validation-data call, sha1-verified, and cached under
+#                    $XDG_CACHE_HOME/open-absinthe. It is not needed to start,
+#                    so losing the cache costs one re-download, never a failed
+#                    start.
+#
+# No wait-* init container: that rule is about a Job whose first action is a
+# network call. This pod reads a local file and binds a local socket; its first
+# outbound request happens on the first client request, long after kube-router
+# has programmed the policy.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openbubbles-relay
+  namespace: openbubbles-relay
+spec:
+  # Stateless: every request is independent and no volume needs a single writer,
+  # so the default rolling update can overlap freely. One replica is about the
+  # single-node cluster, not a state constraint.
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: openbubbles-relay
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: openbubbles-relay
+    spec:
+      # The relay never talks to the API server.
+      automountServiceAccountToken: false
+      securityContext:
+        # uid/gid 10001 is the image's own relay user: relay.Dockerfile:36
+        # creates it, and USER relay is the last word before ENTRYPOINT.
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        # fsGroup so the kubelet hands the cache volume to gid 10001 instead of
+        # leaving a root-owned directory the process cannot write.
+        #
+        # It could not do that job for a PVC: the kubelet does not apply fsGroup
+        # to hostPath-backed local-path volumes (notesnook/servers.yaml records
+        # the same finding and chowns in an init container for it). This app has
+        # no PVC - the cache is an emptyDir, which the kubelet creates per pod -
+        # so no root init container is needed and the whole pod stays non-root.
+        #
+        # OnRootMismatch, not the default Always: Always makes the kubelet
+        # recursively chown every mounted volume before the container starts
+        # (doctor-log 2026-09-09, beets-import).
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        # This node's kubelet runs with seccompDefault=false, so nothing applies
+        # a profile unless a manifest asks for one.
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: relay
+          # Built locally and imported into k3s containerd - there is no
+          # registry, which is why the pull policy is Never (a missing image is
+          # then ErrImageNeverPull rather than a Docker Hub pull loop). Same
+          # arrangement as spatial-sidecar.
+          #
+          # A floating tag is not an option: policy/supply.rego denies 'latest'
+          # and friends outright. Bump this tag on every build.
+          image: openbubbles-relay:0.1.0
+          imagePullPolicy: Never
+          ports:
+            - {name: http, containerPort: 8787}
+          env:
+            # These mirror the image's ENV (relay.Dockerfile:41-43) so the paths
+            # are visible in review. They must agree with the volumeMounts below.
+            - {name: PROFILES_FILE, value: /data/profiles.json}
+            - {name: XDG_CACHE_HOME, value: /data/cache}
+          # Both probes are /health, which answers from process memory and never
+          # calls Apple - so it cannot fail because a dependency is down, and it
+          # is safe to point liveness at. A container failing it is wedged, and
+          # restarting it is the correct response.
+          #
+          # A failing probe also cannot mean 'bad Secret': main() reads
+          # profiles.json before it binds the listener, so a missing or
+          # unparseable file exits the process and the pod crash-loops without
+          # ever serving /health.
+          readinessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: {path: /health, port: http}
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          # Worst case: one QEMU instance per in-flight validation-data request
+          # (the emulator is synchronous and is moved off the reactor with
+          # spawn_blocking, main.rs:79-80), each holding a translation block
+          # plus the ~2 MB binary. The 512Mi limit bounds how many can be in
+          # flight before the pod is killed - the intended failure mode for a
+          # burst of requests - and the service is idle otherwise.
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+            limits: {cpu: "1", memory: 512Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"]}
+            # readOnlyRootFilesystem is deliberately NOT set. The emulator's
+            # scratch paths (unicorn/QEMU temp files, $HOME under /data) have
+            # not been verified, and a wrong guess here is a crash at startup
+            # rather than a warning. To try it: mount emptyDirs at /tmp and
+            # /data, set the flag, and watch the first validation-data call.
+          volumeMounts:
+            # The single file, read-only, via subPath so it does not shadow
+            # /data: $HOME is /data and the process may still write elsewhere
+            # inside it.
+            - {name: profiles, mountPath: /data/profiles.json, subPath: profiles.json, readOnly: true}
+            - {name: cache, mountPath: /data/cache}
+      volumes:
+        - name: profiles
+          secret:
+            # Created by the Doppler operator from the fragment in
+            # gitops-fragments/doppler-secret.yaml (Doppler project
+            # 'kubernetes', config 'prd', key OPENBUBBLES_PROFILES_JSON renamed
+            # to profiles.json). The value is C4: never in git, never printed.
+            secretName: openbubbles-relay-profiles
+            # Explicit, and it is the default: a missing Secret keeps the pod in
+            # ContainerCreating rather than starting a process that would exit
+            # on the unreadable file and crash-loop.
+            optional: false
+        - name: cache
+          # emptyDir rather than a PVC, deliberately. A local-path PVC would
+          # need a root chown init container (see fsGroup above), and this cache
+          # is not worth a root container: the file is public, sha1-verified and
+          # re-fetched lazily on the next request. emptyDir survives a container
+          # restart and is discarded when the pod is replaced, which costs one
+          # 2 MB download.
+          #
+          # If the community mirror ever disappears the cache becomes the only
+          # copy: switch to a small local-path PVC then, and add the ownership
+          # fix. See deploy/gitops/README.md.
+          emptyDir:
+            # Bounds a wedged download. The real file is ~2 MB.
+            sizeLimit: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: openbubbles-relay
+  namespace: openbubbles-relay
+spec:
+  # LoadBalancer, not an Ingress.
+  #
+  # The only client is the OpenBubbles app on a phone, whose relay URL is a
+  # host:port the user types into Settings, and this service speaks plain HTTP.
+  # A LoadBalancer from the existing metallb pool (<metallb-pool-range>; your
+  # Traefik instance pins one of those addresses) gives it a LAN address
+  # without DNS, a certificate or an invented hostname.
+  #
+  # An Ingress was considered and rejected. Policy 9.7 defines a published
+  # service as one reachable from the internet, and an Ingress routes through
+  # the same Traefik the router forwards 80/443 to - so it would owe TLS from
+  # cert-manager, the CrowdSec and rate-limit middlewares, and either Authentik
+  # forward-auth or an owner-signed publication register entry. A phone holding
+  # a bearer code can satisfy none of those.
+  #
+  # Caveat worth knowing (see deploy/gitops/README.md): over the plain LAN path
+  # the bearer code is cleartext and it is a C4 credential; the VPN path is
+  # encrypted by WireGuard/Tailscale. Keep 8787 out of the router's port
+  # forwards and this stays off the internet.
+  type: LoadBalancer
+  # Local, for one reason that matters: the ingress NetworkPolicy matches on the
+  # client's LAN address, and with Cluster policy kube-proxy SNATs every inbound
+  # packet to the node address, so the rule would admit nothing. On a single
+  # node there is no load-imbalance cost to Local.
+  externalTrafficPolicy: Local
+  # To pin the address instead of letting metallb hand out the next free one,
+  # add the annotation Traefik uses:
+  #   metallb.universe.tf/loadBalancerIPs: <loadbalancer-ip>
+  # Read the assigned one from 'kubectl -n openbubbles-relay get svc'.
+  selector:
+    app.kubernetes.io/name: openbubbles-relay
+  ports:
+    - {name: http, port: 8787, targetPort: http}

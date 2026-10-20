@@ -1,0 +1,49 @@
+[package]
+name = "imessage-server-rustpush"
+version = "0.1.0"
+edition = "2021"
+description = "Real Apple IDS backend for imessage-server, built on rustpush."
+license = "AGPL-3.0-only"
+
+# This crate is deliberately NOT a member of the openbubbles-relay workspace
+# (see the root Cargo.toml "exclude"): it depends on imessage-lab/rustpush,
+# whose git submodules are not checked out everywhere. Build it directly:
+#
+#   cd crates/imessage-server-rustpush && cargo build --release
+
+[[bin]]
+name = "imessage-server-rustpush"
+path = "src/main.rs"
+
+# rustpush depends on its own quinn fork (third_party/quinn) and re-declares the
+# same [patch.crates-io] in its own manifest — but a [patch] section is only
+# honoured from the WORKSPACE ROOT, and rustpush is a path dependency here, not
+# the root. Without this, h3-quinn 0.0.10 links against the crates.io quinn while
+# rustpush uses the fork, and src/ids/link.rs:1168 fails with two incompatible
+# `quinn::Connection` types. Keep this in sync with rustpush's own [patch].
+[patch.crates-io]
+quinn = { path = "../../../imessage-lab/rustpush/third_party/quinn/quinn" }
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = "0.7"
+imessage-server = { path = "../imessage-server" }
+keystore = { path = "../../../imessage-lab/rustpush/keystore" }
+# Needed only to construct the anisette provider with a configurable URL:
+# rustpush does not re-export `RemoteAnisetteProviderV3`/`AnisetteClient` (it
+# re-exports only `default_provider`, which hardcodes the URL). This is the same
+# path dependency rustpush declares, so cargo unifies it into one package.
+omnisette = { path = "../../../imessage-lab/rustpush/third_party/apple-private-apis/omnisette", features = ["remote-anisette-v3"] }
+plist = "1.7"
+rustpush = { path = "../../../imessage-lab/rustpush", features = ["macos-validation-data", "remote-anisette-v3"] }
+# Must match rustpush's rustls major so install_default() affects the same
+# CryptoProvider instance the library uses. `ring` only: aws-lc-rs is also in
+# the graph, and having two providers without an explicit default is what makes
+# rustls panic ("could not automatically determine the process-level CryptoProvider").
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }

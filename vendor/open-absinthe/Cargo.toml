@@ -1,0 +1,16 @@
+[package]
+name = "open-absinthe"
+version = "1.0.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+
+[dependencies]
+serde = { version = "1.0.219", features = ["derive"] }
+goblin = "0.8"
+unicorn-engine = "2"
+log = "0.4"
+sha1 = "0.10"
+ureq = "2"
+
+[features]
+serde = []

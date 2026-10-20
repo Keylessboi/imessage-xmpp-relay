@@ -1,0 +1,92 @@
+# Default deny both ways for the whole namespace, then open exactly three flows.
+# One NetworkPolicy governs every pod in the namespace, which is why the
+# intra-namespace rules for the two future services live here: a default-deny
+# ingress policy blocks pod-to-pod traffic inside its OWN namespace too. Immich
+# lost all machine learning to that on 2026-09-03 and no health signal showed it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: app-isolation
+  namespace: openbubbles-relay
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    # 1. The OpenBubbles client. It is an app on a phone, so the source is
+    #    narrowed to the two networks it can come from; the LB address plus a
+    #    bearer code is the whole authentication story.
+    #
+    #    This only means anything because the Service sets
+    #    externalTrafficPolicy: Local. With the default Cluster, kube-proxy
+    #    SNATs every inbound packet to the node address and every client would
+    #    read as 10.42.x.x, so neither CIDR below would ever match (Traefik's
+    #    Service documents the same trap, from the same discovery).
+    - from:
+        - ipBlock:
+            cidr: 192.168.1.0/24
+        - ipBlock:
+            # Tailscale's CGNAT range, for the VPN path. It reaches the pod only
+            # if a tailnet subnet router advertises 192.168.1.0/24; the source
+            # that arrives is then 100.x.y.z rather than the LAN address.
+            cidr: 100.64.0.0/10
+      ports:
+        - {port: 8787, protocol: TCP}
+    # 2. Pods in this namespace. An empty podSelector with no namespaceSelector
+    #    means 'any pod where this policy lives' - the only way a NetworkPolicy
+    #    peer says same-namespace.
+    #      imessage-server -> openbubbles-relay:8787  (validation data)
+    #      bridge          -> imessage-server:8790   (the ports are not guesses:
+    #           imessage-server's Dockerfile sets LISTEN=0.0.0.0:8790 and
+    #           bridge/relay/config.py defaults its upstream client to
+    #           http://imessage-server:8790. The bridge is outbound-only and has
+    #           no listening port, so the flow worth admitting is its egress plus
+    #           this ingress.)
+    #    Policy allows are additive, so this rule is sufficient for
+    #    imessage-server to reach the relay even though that app's manifests do
+    #    not exist yet. Do NOT narrow it to a podSelector for the relay: the
+    #    second flow does not involve the relay at all, and a relay-scoped
+    #    selector would silently drop bridge -> imessage-server.
+    - from:
+        - podSelector: {}
+      ports:
+        - {port: 8787, protocol: TCP}
+        - {port: 8790, protocol: TCP}
+  egress:
+    # DNS through CoreDNS. This is enough here, unlike applemusic-wrapper: the
+    # relay resolves names in-process (ureq -> std -> the pod's
+    # /etc/resolv.conf), so there is no chroot and no fallback to a public
+    # resolver that would need a rule of its own.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - {port: 53, protocol: UDP}
+        - {port: 53, protocol: TCP}
+    # Apple and the community mirror, over 443 only.
+    #
+    # Not narrowed to init.ess.apple.com, for two independent reasons:
+    #   * a NetworkPolicy is L3/L4 and has no notion of a hostname; the
+    #     cluster's engine (kube-router) exposes no FQDN selector either;
+    #   * the destinations are not knowable at deploy time. profile.rs:136-163
+    #     fetches Apple's bag from init.ess.apple.com and then reads the
+    #     id-validation-cert and id-initialize-validation URLs OUT OF THE
+    #     RESPONSE and calls those, so Apple picks the set at runtime.
+    # The mirror is github.com/JJTech0130/nacserver's raw path, which answers
+    # 302 to raw.githubusercontent.com - same port, same problem.
+    #
+    # Private ranges are excluded so this cannot become a general egress path
+    # into the LAN or the cluster, exactly as hermes and applemusic-wrapper do.
+    # 192.168.1.0/24 sits inside 192.168.0.0/16, so the relay cannot reach the
+    # LAN either.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 192.168.0.0/16
+              - 172.16.0.0/12
+      ports:
+        - {port: 443, protocol: TCP}
+    # No port 80: both fetches are HTTPS, and the one redirect involved is
+    # HTTPS to HTTPS.

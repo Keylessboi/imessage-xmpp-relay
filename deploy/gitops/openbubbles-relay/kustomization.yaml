@@ -1,0 +1,41 @@
+# openbubbles-relay: the self-hosted NAC / validation-data oracle that replaces
+# an always-on iPhone for the OpenBubbles client. Source of the image is
+# github.com/Keylessboi/imessage-xmpp-relay (deploy/docker/relay.Dockerfile,
+# built from that repo's root).
+#
+# One shared namespace, three apps. THIS directory declares the Namespace and
+# the namespace-wide NetworkPolicy; two further services land here later as
+# their own apps/ directories with their own kustomizations:
+#   imessage-server  :8790, stateful, its own /data volume
+#   bridge           the XMPP bridge
+# Those two must NOT ship a namespace.yaml: two sources owning one Namespace is
+# a prune fight, and the root ApplicationSet syncs with prune: true, so the
+# loser deletes the other's. They set 'namespace: openbubbles-relay'.
+#
+# Wave 20 = user-facing, after the platform (doppler and friends sit at wave 0).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+metadata:
+  name: openbubbles-relay
+  annotations:
+    argocd.argoproj.io/sync-wave: "20"
+namespace: openbubbles-relay
+# 'labels', NOT 'commonLabels': commonLabels rewrites every selector it finds,
+# and Deployment selectors are immutable - changing one makes ArgoCD fail with
+# 'field is immutable' and silently breaks NetworkPolicy podSelectors by adding
+# labels the target pods do not carry. includeSelectors defaults to false here.
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: homelab
+      app.kubernetes.io/component: messaging
+      homelab/tier: apps
+resources:
+  - namespace.yaml
+  - networkpolicy.yaml
+  - deployment.yaml
+
+# Prune/Delete protection for PVCs, PVs, Namespaces and CNPG Clusters, so a
+# manifest dropped from git never deletes live data. See ADR-0012. This app has
+# no PVC, but it does own the shared Namespace.
+components:
+  - ../../components/protect-state

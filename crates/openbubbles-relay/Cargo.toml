@@ -1,0 +1,25 @@
+[package]
+name = "openbubbles-relay"
+version = "0.1.0"
+edition = "2021"
+description = "HTTP relay: Apple validation data from a hardware profile, plus emit-hwconfig."
+license = "AGPL-3.0-only"
+
+[dependencies]
+open-absinthe = { path = "../../vendor/open-absinthe" }
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+plist = "1.7"
+ureq = "2"
+# Apple's IDS roots (Apple Root CA - G3) are not in the webpki-roots bundle,
+# so we build a root store from webpki-roots + Apple's published roots.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "0.26"
+base64 = "0.22"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[build-dependencies]

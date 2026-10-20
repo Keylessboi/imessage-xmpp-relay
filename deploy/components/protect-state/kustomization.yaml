@@ -1,0 +1,61 @@
+---
+# Stateful objects ArgoCD must never delete on its own.
+#
+# WHY this exists: the root ApplicationSet syncs with prune: true, so removing
+# a manifest from git deletes the live object. For a PVC on local-path that is
+# the data itself - the provisioner's reclaim policy is Delete - and for a
+# Namespace it is every PVC inside it. One bad agent edit (a renamed file, a
+# resources: list that lost a line) would be a restore-from-backup, and the
+# push that caused it would report Synced/Healthy.
+#
+#   Prune=false   removing the manifest from git leaves the object running;
+#                 ArgoCD marks it OutOfSync and a human deletes it on purpose.
+#   Delete=false  deleting the whole Application leaves it too.
+#
+# Deliberately deleting one of these is now two steps: remove it from git,
+# then `kubectl delete` it by hand. That friction is the point.
+#
+# Every apps/*/kustomization.yaml includes this component, and the
+# protected-state job in .github/workflows/validate.yaml fails any render
+# where one of these kinds lacks the annotation. See ADR-0012.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+patches:
+  - target:
+      kind: PersistentVolumeClaim
+    patch: |-
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: any
+        annotations:
+          argocd.argoproj.io/sync-options: Prune=false,Delete=false
+  - target:
+      kind: PersistentVolume
+    patch: |-
+      apiVersion: v1
+      kind: PersistentVolume
+      metadata:
+        name: any
+        annotations:
+          argocd.argoproj.io/sync-options: Prune=false,Delete=false
+  - target:
+      kind: Namespace
+    patch: |-
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: any
+        annotations:
+          argocd.argoproj.io/sync-options: Prune=false,Delete=false
+  - target:
+      group: postgresql.cnpg.io
+      kind: Cluster
+    patch: |-
+      apiVersion: postgresql.cnpg.io/v1
+      kind: Cluster
+      metadata:
+        name: any
+        annotations:
+          argocd.argoproj.io/sync-options: Prune=false,Delete=false

@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.openbubbles.aka"
+    android:versionCode="2"
+    android:versionName="1.1">
+
+    <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="32" />
+
+    <!-- existing EAP-AKA oracle -->
+    <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+    <uses-permission android:name="android.permission.READ_PHONE_NUMBERS" />
+
+    <!-- iMessage carrier-gateway registration (REG-REQ) -->
+    <uses-permission android:name="android.permission.SEND_SMS" />
+    <uses-permission android:name="android.permission.RECEIVE_SMS" />
+    <!-- optional: SMS_INBOX_DUMP fallback path -->
+    <uses-permission android:name="android.permission.READ_SMS" />
+
+    <application android:label="AKA Oracle" android:debuggable="true">
+
+        <!-- EAP-AKA oracle (unchanged) -->
+        <receiver
+            android:name="com.bluebubbles.messaging.services.rustpush.eap_aka.AkaReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.openbubbles.aka.RUN" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Sends REG-REQ to the carrier gateway shortcode -->
+        <receiver
+            android:name="com.openbubbles.aka.RegReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.openbubbles.aka.REGREQ" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Diagnostic: what the framework will tell us about the SIM -->
+        <receiver
+            android:name="com.openbubbles.aka.InfoReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.openbubbles.aka.INFO" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Async SmsManager sent/delivered status (app-internal only) -->
+        <receiver
+            android:name="com.openbubbles.aka.SmsStatusReceiver"
+            android:exported="false" />
+
+        <!-- Inbound SMS capture: SMS_RECEIVED + two adb-test actions -->
+        <receiver
+            android:name="com.openbubbles.aka.SmsReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.provider.Telephony.SMS_RECEIVED" />
+                <action android:name="com.openbubbles.aka.SMS_TEST" />
+                <action android:name="com.openbubbles.aka.SMS_INBOX_DUMP" />
+            </intent-filter>
+        </receiver>
+
+        <!--
+          REG-RESP as a DATA SMS. On some carriers the carrier gateway answers with a
+          port-addressed binary SMS, which does NOT raise SMS_RECEIVED and is NOT stored in
+          content://sms/inbox — an app listening only for the text broadcast sees silence.
+          The reference app (openbubbles PDUReceiver.kt) registers exactly this filter:
+          DATA_SMS_RECEIVED with scheme=sms and NO port, because the port is the carrier's
+          choice. Missing this is why a valid-token REG-REQ appeared to get no reply.
+        -->
+        <receiver
+            android:name="com.openbubbles.aka.PduReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.DATA_SMS_RECEIVED" />
+                <data android:scheme="sms" />
+            </intent-filter>
+        </receiver>
+
+    </application>
+</manifest>

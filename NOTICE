@@ -1,0 +1,73 @@
+imessage-xmpp-relay / openbubbles-relay
+Copyright (C) 2026 Keylessboi and contributors
+
+This project is licensed under the GNU Affero General Public License, version 3
+only (AGPL-3.0-only). The full licence text is in LICENSE.
+
+===============================================================================
+Third-party and vendored components
+===============================================================================
+
+1. vendor/open-absinthe
+
+   This is not third-party code: it is an original implementation by this
+   project's authors, vendored into the tree so the Docker build context is
+   self-contained. It is licensed under the same AGPL-3.0-only terms as the
+   rest of this repository.
+
+   At runtime it downloads Apple's IMDAppleServices binary from a community
+   mirror and executes it inside an emulator as data. That binary is NOT
+   included in, and is NOT redistributed by, this repository or any image built
+   from it. Apple and IMDAppleServices are trademarks of Apple Inc.; this
+   project is not affiliated with or endorsed by Apple.
+
+2. aka-oracle/src - code derived from the Android Open Source Project
+
+   The following files are derived from code from the Android Open Source
+   Project and retain their original licence headers:
+
+       aka-oracle/src/com/bluebubbles/messaging/services/rustpush/eap_aka/
+           AkaReceiver.java
+           BytesConverter.java
+           EapAkaChallenge.java
+           EapAkaResponse.java
+           EapAkaSecurityContext.java
+           MasterKey.java
+
+   Copyright (C) 2021 The Android Open Source Project
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   A copy of the Apache License, Version 2.0 is included in this repository at
+   LICENSES/Apache-2.0.txt and is also available from the URL above.
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+   WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+   License for the specific language governing permissions and limitations
+   under the License.
+
+   Modifications: the files above are copied into this project's package
+   layout and, where noted in the source, adapted to call this project's helper
+   receivers. The rest of aka-oracle/src is original to this project and is
+   AGPL-3.0-only.
+
+3. Dependencies
+
+   Rust crate dependencies are declared in the Cargo.toml files and pinned in
+   the Cargo.lock files; Python dependencies are declared in
+   bridge/requirements.txt and bridge/pyproject.toml. The external
+   imessage-lab/rustpush checkout (see the README) is a separate project under
+   its own licence and is not vendored here.
+
+===============================================================================
+No warranty
+===============================================================================
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU Affero General Public License for more details.

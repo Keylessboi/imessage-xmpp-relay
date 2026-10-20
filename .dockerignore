@@ -1,0 +1,12 @@
+target/
+**/target/
+probe/
+aka-oracle/build/
+.git/
+*.log
+profiles.json
+.env
+.env.*
+*.plist
+gsa.plist
+hwconfig.plist

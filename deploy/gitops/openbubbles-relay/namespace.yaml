@@ -1,0 +1,32 @@
+# Shared namespace. Declared here and only here; imessage-server and bridge
+# (future, their own apps/ directories) target it without a namespace.yaml.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: openbubbles-relay
+  labels:
+    # C4 RESTRICTED. profiles.json maps a bearer code to a hardware profile, and
+    # the bearer code is what authenticates a client to this service - the
+    # policy's C4 definition is disclosure that gives control of a system or an
+    # account. It reaches the cluster only as a Secret, which lands in the k3s
+    # datastore (registered data-store D-05, encrypted at rest). The one
+    # unencrypted volume in the pod is the IMDAppleServices cache: public data
+    # from a community mirror, sha1-verified on every load.
+    homelab/data-class: c4
+    # tier-2 (personal data). The relay alone is reconstructible from Doppler and
+    # would be tier-3, but this namespace is shared with imessage-server, whose
+    # own Dockerfile already sets IMESSAGE_DATA_DIR=/data - message content - and
+    # a namespace carries exactly one label. Record
+    # both in docs/security/00-system-description.md section 4 before the first
+    # deployment (policy 7.2.2).
+    homelab/criticality: tier-2
+    app.kubernetes.io/name: openbubbles-relay
+    app.kubernetes.io/part-of: homelab
+    # enforce baseline, audit and warn restricted - the split spatial-sidecar
+    # uses. The relay's own pod satisfies restricted outright (uid 10001, no
+    # added capabilities, RuntimeDefault seccomp), but imessage-server and
+    # bridge are not written yet and a hard 'restricted' floor would reject them
+    # later for a detail nobody has seen.
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted

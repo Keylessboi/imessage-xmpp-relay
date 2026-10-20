@@ -1,0 +1,9 @@
+[package]
+name = "absinthe-probe"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+
+[dependencies]
+open-absinthe = { path = "../imessage-lab/bubbles/crates/open-absinthe" }
+plist = "1.7"

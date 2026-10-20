@@ -1,0 +1,11 @@
+[workspace]
+members = ["crates/openbubbles-relay", "crates/imessage-server"]
+# The real rustpush-backed backend lives in its own crate that is deliberately
+# NOT a workspace member: it depends on `imessage-lab/rustpush`, whose git
+# submodules (open-absinthe, third_party/apple-private-apis, third_party/quinn,
+# third_party/rustls, third_party/rustls-platform-verifier) are not checked out
+# on this machine. Excluding it keeps `cargo build` at the workspace root green.
+# Build it explicitly once those submodules exist:
+#   cd crates/imessage-server-rustpush && cargo build
+exclude = ["crates/imessage-server-rustpush"]
+resolver = "2"

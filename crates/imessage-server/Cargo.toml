@@ -1,0 +1,34 @@
+[package]
+name = "imessage-server"
+version = "0.1.0"
+edition = "2021"
+description = "Headless Linux iMessage (Apple IDS) server with a small local HTTP API."
+license = "AGPL-3.0-only"
+
+[lib]
+name = "imessage_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "imessage-server"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = "0.7"
+base64 = "0.22"
+dotenvy = "0.15"
+plist = "1.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
